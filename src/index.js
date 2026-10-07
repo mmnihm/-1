@@ -120,8 +120,17 @@ function menu() {
 function cleanChatId(value) {
   const s = String(value || '').trim();
   if (/^-?\d+$/.test(s)) return Number(s);
-  const m = s.match(/(?:t\.me\/|@)([A-Za-z0-9_]+)/);
+  const m = s.match(/(?:https?:\/\/)?(?:t\.me\/|@)([A-Za-z0-9_]+)/i);
   return m ? '@' + m[1] : s;
+}
+
+async function resolveChatId(value) {
+  const cleaned = cleanChatId(value);
+  if (typeof cleaned === 'number') return cleaned;
+  if (!cleaned) throw new Error('频道/群不能为空');
+  const chat = await bot.telegram.getChat(cleaned);
+  if (!chat?.id) throw new Error('无法获取频道/群 ID');
+  return Number(chat.id);
 }
 
 function getMessageType(msg) {
@@ -417,12 +426,13 @@ bot.action(/^filter_task_(\d+)$/, async ctx => {
       [Markup.button.callback(`视频 ${filters.video ? '✅' : '❌'}`, `ft_${taskId}_video`), Markup.button.callback(`文件 ${filters.document ? '✅' : '❌'}`, `ft_${taskId}_document`)],
       [Markup.button.callback(`音频 ${filters.audio ? '✅' : '❌'}`, `ft_${taskId}_audio`), Markup.button.callback(`语音 ${filters.voice ? '✅' : '❌'}`, `ft_${taskId}_voice`)],
       [Markup.button.callback(`动图 ${filters.animation ? '✅' : '❌'}`, `ft_${taskId}_animation`), Markup.button.callback(`贴纸 ${filters.sticker ? '✅' : '❌'}`, `ft_${taskId}_sticker`)],
+      [Markup.button.callback(`视频消息 ${filters.video_note ? '✅' : '❌'}`, `ft_${taskId}_video_note`), Markup.button.callback(`其他 ${filters.other ? '✅' : '❌'}`, `ft_${taskId}_other`)],
       [Markup.button.callback('⬅️ 返回', 'filters')]
     ])
   );
 });
 
-bot.action(/^ft_(\d+)_(text|photo|video|document|audio|voice|animation|sticker)$/, async ctx => {
+bot.action(/^ft_(\d+)_(text|photo|video|document|audio|voice|animation|sticker|video_note|other)$/, async ctx => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery();
   const taskId = Number(ctx.match[1]);
   const type = ctx.match[2];
@@ -506,31 +516,41 @@ bot.on('text', async ctx => {
   const chat = cleanChatId(ctx.message.text);
 
   if (session.step === 'source') {
-    session.source = chat;
-    session.step = 'target';
-    return ctx.reply(`✅ 源已记录：${chat}\n\n现在请发送【目标频道/群】的 ID、@用户名或 t.me 链接。`);
+    try {
+      const source = await resolveChatId(chat);
+      session.source = source;
+      session.step = 'target';
+      return ctx.reply(`✅ 源已绑定：${source}\\n\\n现在请发送【目标频道/群】的 ID、@用户名或 t.me 链接。`);
+    } catch (err) {
+      return ctx.reply(`❌ 无法绑定这个源频道/群。\\n\\n请确认机器人已经加入该频道/群，并且有读取消息的权限。\\n错误：${err?.message || err}`);
+    }
   }
 
   if (session.step === 'target') {
-    if (String(chat) === String(session.source)) {
-      return ctx.reply('❌ 源和目标不能相同。\n请重新发送目标频道/群。');
+    try {
+      const target = await resolveChatId(chat);
+      if (Number(target) === Number(session.source)) {
+        return ctx.reply('❌ 源和目标不能相同。\\n请重新发送目标频道/群。');
+      }
+
+      const p = await db();
+      await p.query(
+        `INSERT INTO forward_tasks
+         (admin_id, source_chat_id, target_chat_id, status, realtime, filters_json)
+         VALUES (?, ?, ?, 'paused', 1, ?)
+         ON DUPLICATE KEY UPDATE updated_at=CURRENT_TIMESTAMP`,
+        [adminId, session.source, target, JSON.stringify(DEFAULT_FILTERS)]
+      );
+
+      const source = session.source;
+      sessions.delete(ctx.from.id);
+      return ctx.reply(
+        `✅ 转发任务已添加\\n\\n源：${source}\\n目标：${target}\\n\\n如需历史消息，请先设置历史范围；实时转发默认开启。`,
+        menu()
+      );
+    } catch (err) {
+      return ctx.reply(`❌ 无法绑定这个目标频道/群。\\n\\n请确认机器人已经加入目标频道/群，并且有发送消息的权限。\\n错误：${err?.message || err}`);
     }
-
-    const p = await db();
-    await p.query(
-      `INSERT INTO forward_tasks
-       (admin_id, source_chat_id, target_chat_id, status, realtime, filters_json)
-       VALUES (?, ?, ?, 'paused', 1, ?)
-       ON DUPLICATE KEY UPDATE updated_at=CURRENT_TIMESTAMP`,
-      [adminId, session.source, chat, JSON.stringify(DEFAULT_FILTERS)]
-    );
-
-    const source = session.source;
-    sessions.delete(ctx.from.id);
-    return ctx.reply(
-      `✅ 转发任务已添加\n\n源：${source}\n目标：${chat}\n\n如需历史消息，请先设置历史范围；实时转发默认开启。`,
-      menu()
-    );
   }
 });
 
