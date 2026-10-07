@@ -117,6 +117,7 @@ async function syncTask(task) {
       }
       nextId = batchEnd + 1;
     }
+  }
   await p.query('UPDATE forward_tasks SET history_done=1,status="paused" WHERE id=?', [task.id]);
 }
 
