@@ -238,6 +238,7 @@ async function syncTask(task) {
             'UPDATE forward_tasks SET history_processed=history_processed+1, history_next_id=? WHERE id=?',
             [id + 1, task.id]
           );
+          nextId = id + 1;
           continue;
         }
 
@@ -254,6 +255,7 @@ async function syncTask(task) {
               'UPDATE forward_tasks SET history_processed=history_processed+1, history_skipped=history_skipped+1, history_next_id=? WHERE id=?',
               [id + 1, task.id]
             );
+            nextId = id + 1;
             continue;
           }
 
