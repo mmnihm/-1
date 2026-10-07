@@ -622,6 +622,10 @@ async function handleRealtimeMessage(ctx, message, chatId) {
       );
     } catch (err) {
       console.error('实时转发失败', task.id, message.message_id, err?.message || err);
+      await p.query(
+        'UPDATE forward_tasks SET history_failed=history_failed+1, updated_at=CURRENT_TIMESTAMP WHERE id=?',
+        [task.id]
+      );
     } finally {
       forwardingLocks.delete(lockKey);
     }
