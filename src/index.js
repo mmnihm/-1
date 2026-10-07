@@ -42,6 +42,9 @@ async function db() {
         source_message_id BIGINT DEFAULT 0,
         status VARCHAR(20) NOT NULL DEFAULT 'paused',
         realtime TINYINT(1) NOT NULL DEFAULT 1,
+        history_next_id BIGINT DEFAULT 0,
+        history_end_id BIGINT DEFAULT 0,
+        history_done TINYINT(1) NOT NULL DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         UNIQUE KEY uq_task (admin_id, source_chat_id, target_chat_id)
@@ -58,6 +61,7 @@ function isAdmin(ctx) {
 function menu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('➕ 添加任务', 'add_task')],
+    [Markup.button.callback('🕘 设置历史范围', 'set_history')],
     [Markup.button.callback('▶️ 开始同步', 'start_sync'), Markup.button.callback('⏸ 暂停同步', 'pause_sync')],
     [Markup.button.callback('🔄 实时转发', 'realtime')],
     [Markup.button.callback('📋 我的任务', 'tasks'), Markup.button.callback('🗑 删除任务', 'delete_task')]
@@ -78,6 +82,47 @@ async function getTasks() {
     [adminId]
   );
   return rows;
+}
+
+async function syncTask(task) {
+  const p = await db();
+  let nextId = Number(task.history_next_id || 0);
+  const endId = Number(task.history_end_id || 0);
+  if (!nextId || !endId || nextId > endId) return;
+  for (let id = nextId; id <= endId; id++) {
+    const [rows] = await p.query('SELECT status FROM forward_tasks WHERE id=?', [task.id]);
+    if (!rows.length || rows[0].status !== 'running') return;
+    try {
+      await copyWithRetry(task.source_chat_id, task.target_chat_id, id);
+      await p.query('UPDATE forward_tasks SET history_next_id=? WHERE id=?', [id + 1, task.id]);
+    } catch (err) {
+      if (isNotFoundMessage(err)) {
+        await p.query('UPDATE forward_tasks SET history_next_id=? WHERE id=?', [id + 1, task.id]);
+        continue;
+      }
+      console.error('历史同步失败', task.id, id, err?.message || err);
+      await p.query('UPDATE forward_tasks SET status="paused" WHERE id=?', [task.id]);
+      return;
+    }
+  }
+  await p.query('UPDATE forward_tasks SET history_done=1,status="paused" WHERE id=?', [task.id]);
+}
+
+function isNotFoundMessage(err) {
+  const code = Number(err?.response?.error_code || 0);
+  const desc = String(err?.response?.description || err?.message || '');
+  return code === 400 && /message to copy not found|message_id_invalid|message not found/i.test(desc);
+}
+
+async function startHistoryJobs() {
+  const p = await db();
+  const [tasks] = await p.query(
+    'SELECT * FROM forward_tasks WHERE admin_id=? AND status="running" AND history_done=0',
+    [adminId]
+  );
+  for (const task of tasks) {
+    syncTask(task).catch(err => console.error('历史任务异常', task.id, err));
+  }
 }
 
 async function showTasks(ctx) {
@@ -166,12 +211,39 @@ bot.action(/^del_(\\d+)$/, async ctx => {
   return ctx.reply(r.affectedRows ? `🗑 任务 #${taskId} 已删除。` : '⚠️ 任务不存在。', menu());
 });
 
+bot.action('set_history', async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  const rows = await getTasks();
+  if (!rows.length) return ctx.answerCbQuery('没有任务');
+  sessions.set(ctx.from.id, { step: 'history_task', taskId: rows[0].id });
+  await ctx.answerCbQuery();
+  return ctx.reply('请发送任务编号和历史结束消息 ID，例如：1 5000');
+});
+
 bot.on('text', async ctx => {
   if (!isAdmin(ctx)) return;
   const session = sessions.get(ctx.from.id);
   if (!session) return;
 
   const chat = cleanChatId(ctx.message.text);
+
+  if (session.step === 'history_task') {
+    const parts = String(ctx.message.text).trim().split(/\s+/);
+    const taskId = Number(parts[0]);
+    const endId = Number(parts[1]);
+    if (!Number.isInteger(taskId) || !Number.isInteger(endId) || endId < 1) {
+      return ctx.reply('格式错误，请发送：任务编号 结束消息ID，例如：1 5000');
+    }
+    const p = await db();
+    const [rows] = await p.query('SELECT * FROM forward_tasks WHERE id=? AND admin_id=?', [taskId, adminId]);
+    if (!rows.length) return ctx.reply('❌ 找不到这个任务。');
+    await p.query(
+      'UPDATE forward_tasks SET history_next_id=IF(history_next_id=0,1,history_next_id), history_end_id=?, history_done=0 WHERE id=?',
+      [endId, taskId]
+    );
+    sessions.delete(ctx.from.id);
+    return ctx.reply(`✅ 已设置任务 #${taskId} 的历史结束 ID：${endId}\\n现在点击“▶️ 开始同步”。`, menu());
+  }
 
   if (session.step === 'source') {
     session.source = chat;
