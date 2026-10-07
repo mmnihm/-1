@@ -112,75 +112,113 @@ async function db() {
         KEY idx_task (task_id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS telegram_auth (
+        admin_id BIGINT PRIMARY KEY,
+        api_id BIGINT NOT NULL,
+        api_hash VARCHAR(128) NOT NULL,
+        tg_session LONGTEXT NOT NULL,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `);
   }
   return pool;
 }
 
+async function getTelegramAuth() {
+  const p = await db();
+  const [rows] = await p.query(
+    'SELECT api_id, api_hash, tg_session FROM telegram_auth WHERE admin_id=? LIMIT 1',
+    [adminId]
+  );
+  return rows[0] || null;
+}
+
+async function saveTelegramAuth(apiId, apiHash, tgSession) {
+  const p = await db();
+  await p.query(
+    `INSERT INTO telegram_auth (admin_id, api_id, api_hash, tg_session)
+     VALUES (?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE api_id=VALUES(api_id), api_hash=VALUES(api_hash), tg_session=VALUES(tg_session)`,
+    [adminId, Number(apiId), apiHash, tgSession]
+  );
+}
+
+async function attachTelegramEvents(client) {
+  client.addEventHandler(async event => {
+    try {
+      const message = event.message;
+      const sourceChatId = message?.chatId != null ? Number(message.chatId) : null;
+      if (!message?.id || sourceChatId == null) return;
+
+      const p = await db();
+      const [tasks] = await p.query(
+        'SELECT * FROM forward_tasks WHERE source_chat_id=? AND realtime=1',
+        [sourceChatId]
+      );
+
+      for (const task of tasks) {
+        if (Number(task.target_chat_id) === sourceChatId) continue;
+
+        const filters = parseFilters(task.filters_json);
+        const type = getGramJsMessageType(message);
+        if (!filters[type]) continue;
+
+        if (message.groupedId != null) {
+          const key = `album:${task.id}:${sourceChatId}:${String(message.groupedId)}`;
+          let queue = albumQueues.get(key);
+          if (!queue) {
+            queue = { task, sourceChatId, ids: new Set(), timer: null };
+            albumQueues.set(key, queue);
+          }
+          queue.ids.add(Number(message.id));
+          if (queue.timer) clearTimeout(queue.timer);
+          queue.timer = setTimeout(() => {
+            forwardTelegramAlbum(key).catch(err =>
+              console.error('MTProto 相册转发失败', task.id, message.groupedId, err?.message || err)
+            );
+          }, 700);
+        } else {
+          await forwardTelegramMessages(task, sourceChatId, [Number(message.id)]);
+        }
+      }
+    } catch (err) {
+      console.error('MTProto 新消息处理失败', err?.message || err);
+    }
+  }, new NewMessage({}));
+}
+
 async function startTelegramUserClient() {
-  if (!TG_API_ID || !TG_API_HASH || !TG_SESSION) {
-    console.log('Telegram 账号转发未启用：请设置 TG_API_ID、TG_API_HASH、TG_SESSION');
+  const saved = await getTelegramAuth();
+  const apiId = saved?.api_id || TG_API_ID;
+  const apiHash = saved?.api_hash || TG_API_HASH;
+  const tgSession = saved?.tg_session || TG_SESSION;
+
+  if (!apiId || !apiHash || !tgSession) {
+    console.log('Telegram 账号转发未启用：请在机器人中点击“🔐 Telegram账号登录”');
     return;
   }
 
   try {
     userClient = new TelegramClient(
-      new StringSession(TG_SESSION),
-      Number(TG_API_ID),
-      TG_API_HASH,
+      new StringSession(tgSession),
+      Number(apiId),
+      apiHash,
       { connectionRetries: 5 }
     );
     await userClient.connect();
 
     if (!(await userClient.checkAuthorization())) {
-      throw new Error('TG_SESSION 无效或已失效，请重新生成登录会话');
+      throw new Error('Telegram 登录会话无效，请在机器人中重新登录');
     }
 
-    userClient.addEventHandler(async event => {
-      try {
-        const message = event.message;
-        const sourceChatId = message?.chatId != null ? Number(message.chatId) : null;
-        if (!message?.id || sourceChatId == null) return;
-
-        const p = await db();
-        const [tasks] = await p.query(
-          'SELECT * FROM forward_tasks WHERE source_chat_id=? AND realtime=1',
-          [sourceChatId]
-        );
-
-        for (const task of tasks) {
-          if (Number(task.target_chat_id) === sourceChatId) continue;
-
-          const filters = parseFilters(task.filters_json);
-          const type = getGramJsMessageType(message);
-          if (!filters[type]) continue;
-
-          if (message.groupedId != null) {
-            const key = `album:${task.id}:${sourceChatId}:${String(message.groupedId)}`;
-            let queue = albumQueues.get(key);
-            if (!queue) {
-              queue = { task, sourceChatId, ids: new Set(), timer: null };
-              albumQueues.set(key, queue);
-            }
-            queue.ids.add(Number(message.id));
-            if (queue.timer) clearTimeout(queue.timer);
-            queue.timer = setTimeout(() => {
-              forwardTelegramAlbum(key).catch(err =>
-                console.error('MTProto 相册转发失败', task.id, message.groupedId, err?.message || err)
-              );
-            }, 700);
-          } else {
-            await forwardTelegramMessages(task, sourceChatId, [Number(message.id)]);
-          }
-        }
-      } catch (err) {
-        console.error('MTProto 新消息处理失败', err?.message || err);
-      }
-    }, new NewMessage({}));
-
+    await attachTelegramEvents(userClient);
     userClientReady = true;
     console.log('Telegram 账号已登录，MTProto 实时转发已启用');
   } catch (err) {
     userClientReady = false;
+    userClient = null;
     console.error('Telegram 账号登录失败：', err?.message || err);
   }
 }
@@ -268,6 +306,7 @@ function menu() {
     [Markup.button.callback('🕘 设置历史范围', 'set_history')],
     [Markup.button.callback('▶️ 开始同步', 'start_sync'), Markup.button.callback('⏸ 暂停同步', 'pause_sync')],
     [Markup.button.callback('🔄 实时转发', 'realtime')],
+    [Markup.button.callback('🔐 Telegram账号登录', 'tg_login')],
     [Markup.button.callback('🎛 过滤设置', 'filters'), Markup.button.callback('📊 任务进度', 'progress')],
     [Markup.button.callback('📋 我的任务', 'tasks'), Markup.button.callback('🗑 删除任务', 'delete_task')]
   ]);
@@ -479,6 +518,40 @@ bot.command('menu', async ctx => {
   return ctx.reply('🤖 主菜单', menu());
 });
 
+bot.action('tg_login', async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  const saved = await getTelegramAuth();
+  sessions.set(ctx.from.id, {
+    step: 'tg_api_id',
+    apiId: saved?.api_id ? String(saved.api_id) : '',
+    apiHash: saved?.api_hash || ''
+  });
+  await ctx.answerCbQuery();
+  return ctx.reply(
+    '🔐 Telegram账号登录\\n\\n' +
+    '用于读取源频道/群并进行 MTProto 转发。\\n\\n' +
+    '第1步：发送 Telegram API ID。\\n' +
+    '第2步：发送 Telegram API Hash。\\n' +
+    '第3步：发送手机号。\\n' +
+    '第4步：发送验证码。\\n' +
+    '第5步：如有两步验证，再发送密码。'
+  );
+});
+
+bot.action('tg_logout', async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  const p = await db();
+  await p.query('DELETE FROM telegram_auth WHERE admin_id=?', [adminId]);
+  if (userClient) {
+    try { await userClient.disconnect(); } catch {}
+  }
+  userClient = null;
+  userClientReady = false;
+  sessions.delete(ctx.from.id);
+  await ctx.answerCbQuery('已退出');
+  return ctx.reply('🔓 Telegram账号登录已清除。', menu());
+});
+
 bot.action('add_task', async ctx => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery();
   sessions.set(ctx.from.id, { step: 'source' });
@@ -673,6 +746,48 @@ bot.on('text', async (ctx, next) => {
   const session = sessions.get(ctx.from.id);
   if (!session) return next();
 
+  if (session.step === 'tg_api_id') {
+    const apiId = String(ctx.message.text).trim();
+    if (!/^\\d+$/.test(apiId)) return ctx.reply('❌ API ID 必须是数字，请重新发送。');
+    session.apiId = apiId;
+    session.step = 'tg_api_hash';
+    return ctx.reply('第2步：请发送 Telegram API Hash。');
+  }
+
+  if (session.step === 'tg_api_hash') {
+    const apiHash = String(ctx.message.text).trim();
+    if (!/^[A-Za-z0-9_-]{20,}$/.test(apiHash)) return ctx.reply('❌ API Hash 格式不正确，请重新发送。');
+    session.apiHash = apiHash;
+    session.step = 'tg_phone';
+    return ctx.reply('第3步：请发送 Telegram 手机号（含国家区号，例如 +8613812345678）。');
+  }
+
+  if (session.step === 'tg_phone') {
+    const phone = String(ctx.message.text).trim();
+    if (!/^\\+?[1-9]\\d{6,14}$/.test(phone)) return ctx.reply('❌ 手机号格式不正确，请重新发送。');
+    session.phone = phone;
+    runTelegramBotLogin(ctx.from.id).catch(err => {
+      console.error('机器人内 Telegram 登录失败', err?.message || err);
+      sessions.delete(ctx.from.id);
+      bot.telegram.sendMessage(ctx.from.id, `❌ Telegram 登录失败：${err?.message || err}\\n\\n请重新点击“🔐 Telegram账号登录”。`, menu()).catch(() => {});
+    });
+    return ctx.reply('⏳ 正在请求 Telegram 验证码，请稍候……');
+  }
+
+  if (session.step === 'tg_code') {
+    const resolve = session.codeResolve;
+    session.codeResolve = null;
+    if (resolve) resolve(String(ctx.message.text).trim());
+    return;
+  }
+
+  if (session.step === 'tg_password') {
+    const resolve = session.passwordResolve;
+    session.passwordResolve = null;
+    if (resolve) resolve(String(ctx.message.text));
+    return;
+  }
+
   if (session.step === 'history_task') {
     const parts = String(ctx.message.text).trim().split(/\s+/);
     const taskId = Number(parts[0]);
@@ -739,6 +854,55 @@ bot.on('text', async (ctx, next) => {
     }
   }
 });
+
+async function waitTelegramInput(userId, step, field, prompt) {
+  const session = sessions.get(userId);
+  if (!session) throw new Error('登录会话已结束');
+  session.step = step;
+  await bot.telegram.sendMessage(userId, prompt);
+  return await new Promise((resolve, reject) => {
+    session[field] = resolve;
+    session.rejectInput = reject;
+  });
+}
+
+async function runTelegramBotLogin(userId) {
+  const session = sessions.get(userId);
+  if (!session) throw new Error('登录会话不存在');
+
+  const client = new TelegramClient(
+    new StringSession(''),
+    Number(session.apiId),
+    session.apiHash,
+    { connectionRetries: 5 }
+  );
+
+  await client.start({
+    phoneNumber: async () => session.phone,
+    phoneCode: async () =>
+      await waitTelegramInput(userId, 'tg_code', 'codeResolve', '📲 第4步：请把 Telegram 收到的验证码发送给我。'),
+    password: async () =>
+      await waitTelegramInput(userId, 'tg_password', 'passwordResolve', '🔐 第5步：请输入 Telegram 两步验证密码。'),
+    onError: err => console.error('Telegram 机器人登录错误：', err?.message || err)
+  });
+
+  const tgSession = client.session.save();
+  await saveTelegramAuth(session.apiId, session.apiHash, tgSession);
+
+  if (userClient) {
+    try { await userClient.disconnect(); } catch {}
+  }
+  userClient = client;
+  await attachTelegramEvents(userClient);
+  userClientReady = true;
+
+  sessions.delete(userId);
+  await bot.telegram.sendMessage(
+    userId,
+    '✅ Telegram账号登录成功！\\n账号已保存到机器人数据库，VPS重启后无需重新登录。',
+    menu()
+  );
+}
 
 async function handleRealtimeMessage(ctx, message, chatId) {
   if (!message?.message_id || !chatId) return;
