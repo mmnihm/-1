@@ -32,8 +32,8 @@ const sessions = new Map();
 const runningJobs = new Set();
 const forwardingLocks = new Set();
 const albumQueues = new Map();
-let userClient = null;
-let userClientReady = false;
+const userClients = new Map();
+const clientStarting = new Map();
 
 const DEFAULT_FILTERS = {
   text: true,
@@ -126,101 +126,73 @@ async function db() {
   return pool;
 }
 
-async function getTelegramAuth() {
+async function getTelegramAuth(userId) {
   const p = await db();
-  const [rows] = await p.query(
-    'SELECT api_id, api_hash, tg_session FROM telegram_auth WHERE admin_id=? LIMIT 1',
-    [adminId]
-  );
+  const [rows] = await p.query('SELECT api_id, api_hash, tg_session FROM telegram_auth WHERE admin_id=? LIMIT 1',[Number(userId)]);
   return rows[0] || null;
 }
-
-async function saveTelegramAuth(apiId, apiHash, tgSession) {
+async function saveTelegramAuth(userId, apiId, apiHash, tgSession) {
   const p = await db();
-  await p.query(
-    `INSERT INTO telegram_auth (admin_id, api_id, api_hash, tg_session)
-     VALUES (?, ?, ?, ?)
-     ON DUPLICATE KEY UPDATE api_id=VALUES(api_id), api_hash=VALUES(api_hash), tg_session=VALUES(tg_session)`,
-    [adminId, Number(apiId), apiHash, tgSession]
-  );
+  await p.query(`INSERT INTO telegram_auth (admin_id, api_id, api_hash, tg_session)
+    VALUES (?, ?, ?, ?)
+    ON DUPLICATE KEY UPDATE api_id=VALUES(api_id), api_hash=VALUES(api_hash), tg_session=VALUES(tg_session)`,
+    [Number(userId),Number(apiId),apiHash,tgSession]);
 }
 
-async function attachTelegramEvents(client) {
-  client.addEventHandler(async event => {
-    try {
-      const message = event.message;
-      const sourceChatId = message?.chatId != null ? Number(message.chatId) : null;
-      if (!message?.id || sourceChatId == null) return;
-
-      const p = await db();
-      const [tasks] = await p.query(
-        'SELECT * FROM forward_tasks WHERE source_chat_id=? AND realtime=1',
-        [sourceChatId]
+async function attachTelegramEvents(client, ownerId) {
+  const uid=Number(ownerId);
+  client.addEventHandler(async event=>{
+    try{
+      const message=event.message;
+      const sourceChatId=message?.chatId!=null?Number(message.chatId):null;
+      if(!message?.id||sourceChatId==null)return;
+      const p=await db();
+      const [tasks]=await p.query(
+        'SELECT * FROM forward_tasks WHERE admin_id=? AND source_chat_id=? AND realtime=1',
+        [uid,sourceChatId]
       );
-
-      for (const task of tasks) {
-        if (Number(task.target_chat_id) === sourceChatId) continue;
-
-        const filters = parseFilters(task.filters_json);
-        const type = getGramJsMessageType(message);
-        if (!filters[type]) continue;
-
-        if (message.groupedId != null) {
-          const key = `album:${task.id}:${sourceChatId}:${String(message.groupedId)}`;
-          let queue = albumQueues.get(key);
-          if (!queue) {
-            queue = { task, sourceChatId, ids: new Set(), timer: null };
-            albumQueues.set(key, queue);
+      for(const task of tasks){
+        if(Number(task.target_chat_id)===sourceChatId)continue;
+        const filters=parseFilters(task.filters_json);
+        if(!filters[getGramJsMessageType(message)])continue;
+        if(message.groupedId!=null){
+          const key=`album:${task.id}:${sourceChatId}:${String(message.groupedId)}`;
+          let queue=albumQueues.get(key);
+          if(!queue){
+            queue={task,ownerId:uid,sourceChatId,ids:new Set(),timer:null};
+            albumQueues.set(key,queue);
           }
           queue.ids.add(Number(message.id));
-          if (queue.timer) clearTimeout(queue.timer);
-          queue.timer = setTimeout(() => {
-            forwardTelegramAlbum(key).catch(err =>
-              console.error('MTProto 相册转发失败', task.id, message.groupedId, err?.message || err)
-            );
-          }, 700);
-        } else {
-          await forwardTelegramMessages(task, sourceChatId, [Number(message.id)]);
+          if(queue.timer)clearTimeout(queue.timer);
+          queue.timer=setTimeout(()=>forwardTelegramAlbum(key).catch(err=>console.error('MTProto 相册转发失败',task.id,err?.message||err)),700);
+        }else{
+          await forwardTelegramMessages(task,sourceChatId,[Number(message.id)],uid);
         }
       }
-    } catch (err) {
-      console.error('MTProto 新消息处理失败', err?.message || err);
-    }
-  }, new NewMessage({}));
+    }catch(err){console.error('MTProto 新消息处理失败',err?.message||err);}
+  },new NewMessage({}));
 }
 
-async function startTelegramUserClient() {
-  const saved = await getTelegramAuth();
-  const apiId = saved?.api_id || TG_API_ID;
-  const apiHash = saved?.api_hash || TG_API_HASH;
-  const tgSession = saved?.tg_session || TG_SESSION;
-
-  if (!apiId || !apiHash || !tgSession) {
-    console.log('Telegram 账号转发未启用：请在机器人中点击“🔐 Telegram账号登录”');
-    return;
-  }
-
-  try {
-    userClient = new TelegramClient(
-      new StringSession(tgSession),
-      Number(apiId),
-      apiHash,
-      { connectionRetries: 5 }
-    );
-    await userClient.connect();
-
-    if (!(await userClient.checkAuthorization())) {
-      throw new Error('Telegram 登录会话无效，请在机器人中重新登录');
-    }
-
-    await attachTelegramEvents(userClient);
-    userClientReady = true;
-    console.log('Telegram 账号已登录，MTProto 实时转发已启用');
-  } catch (err) {
-    userClientReady = false;
-    userClient = null;
-    console.error('Telegram 账号登录失败：', err?.message || err);
-  }
+async function startTelegramUserClient(userId) {
+  const uid=Number(userId);
+  const saved=await getTelegramAuth(uid);
+  const apiId=saved?.api_id||TG_API_ID;
+  const apiHash=saved?.api_hash||TG_API_HASH;
+  const tgSession=saved?.tg_session||(uid===adminId?TG_SESSION:'');
+  if(!apiId||!apiHash||!tgSession)return null;
+  if(clientStarting.has(uid))return clientStarting.get(uid);
+  const promise=(async()=>{
+    const old=userClients.get(uid);
+    if(old){try{await old.disconnect();}catch{}}
+    const client=new TelegramClient(new StringSession(tgSession),Number(apiId),apiHash,{connectionRetries:5});
+    await client.connect();
+    if(!(await client.checkAuthorization()))throw new Error('Telegram 登录会话无效，请重新登录');
+    await attachTelegramEvents(client,uid);
+    userClients.set(uid,client);
+    return client;
+  })();
+  clientStarting.set(uid,promise);
+  try{return await promise;}finally{clientStarting.delete(uid);}
 }
 
 async function forwardTelegramAlbum(key) {
@@ -228,10 +200,12 @@ async function forwardTelegramAlbum(key) {
   if (!queue) return;
   albumQueues.delete(key);
   const ids = [...queue.ids].sort((a, b) => a - b);
-  if (ids.length) await forwardTelegramMessages(queue.task, queue.sourceChatId, ids);
+  if (ids.length) await forwardTelegramMessages(queue.task, queue.sourceChatId, ids, queue.ownerId);
 }
 
-async function forwardTelegramMessages(task, sourceChatId, messageIds) {
+async function forwardTelegramMessages(task, sourceChatId, messageIds, ownerId) {
+  const client=userClients.get(Number(ownerId));
+  if(!client)return;
   const p = await db();
   const pending = [];
   for (const id of [...new Set(messageIds.map(Number).filter(Boolean))]) {
@@ -247,9 +221,9 @@ async function forwardTelegramMessages(task, sourceChatId, messageIds) {
   if (!pending.length) return;
 
   try {
-    const target = await userClient.getEntity(Number(task.target_chat_id));
-    const source = await userClient.getEntity(Number(sourceChatId));
-    const result = await userClient.forwardMessages(target, {
+    const target = await client.getEntity(Number(task.target_chat_id));
+    const source = await client.getEntity(Number(sourceChatId));
+    const result = await client.forwardMessages(target, {
       messages: pending.map(x => x.id),
       fromPeer: source
     });
@@ -300,15 +274,17 @@ function isAdmin(ctx) {
   return Number(ctx.from?.id) === adminId;
 }
 
-function menu() {
+function menu(userId) {
+  const loggedIn=userClients.has(Number(userId));
   return Markup.inlineKeyboard([
-    [Markup.button.callback('➕ 添加任务', 'add_task')],
-    [Markup.button.callback('🕘 设置历史范围', 'set_history')],
-    [Markup.button.callback('▶️ 开始同步', 'start_sync'), Markup.button.callback('⏸ 暂停同步', 'pause_sync')],
-    [Markup.button.callback('🔄 实时转发', 'realtime')],
-    [Markup.button.callback('🔐 Telegram账号登录', 'tg_login')],
-    [Markup.button.callback('🎛 过滤设置', 'filters'), Markup.button.callback('📊 任务进度', 'progress')],
-    [Markup.button.callback('📋 我的任务', 'tasks'), Markup.button.callback('🗑 删除任务', 'delete_task')]
+    [Markup.button.callback(loggedIn?'✅ Telegram账号已登录':'🔐 Telegram账号登录','tg_login')],
+    [Markup.button.callback('➕ 添加任务','add_task')],
+    [Markup.button.callback('🕘 设置历史范围','set_history')],
+    [Markup.button.callback('▶️ 开始同步','start_sync'),Markup.button.callback('⏸ 暂停同步','pause_sync')],
+    [Markup.button.callback('🔄 实时转发','realtime')],
+    [Markup.button.callback('🎛 过滤设置','filters'),Markup.button.callback('📊 任务进度','progress')],
+    [Markup.button.callback('📋 我的任务','tasks'),Markup.button.callback('🗑 删除任务','delete_task')],
+    ...(loggedIn?[[Markup.button.callback('🔓 退出 Telegram账号','tg_logout')]]:[])
   ]);
 }
 
@@ -319,13 +295,17 @@ function cleanChatId(value) {
   return m ? '@' + m[1] : s;
 }
 
-async function resolveChatId(value) {
-  const cleaned = cleanChatId(value);
-  if (typeof cleaned === 'number') return cleaned;
-  if (!cleaned) throw new Error('频道/群不能为空');
-  const chat = await bot.telegram.getChat(cleaned);
-  if (!chat?.id) throw new Error('无法获取频道/群 ID');
-  return Number(chat.id);
+async function resolveChatId(value, client) {
+  const cleaned=cleanChatId(value);
+  if(!cleaned)throw new Error('频道/群不能为空');
+  if(typeof cleaned==='number')return cleaned;
+  if(!client)throw new Error('请先登录 Telegram');
+  const entity=await client.getEntity(cleaned);
+  const id=Number(entity?.id);
+  if(!Number.isFinite(id))throw new Error('无法获取频道/群 ID');
+  if(entity.className==='Channel')return -1000000000000+id;
+  if(entity.className==='Chat')return -id;
+  return id;
 }
 
 function getMessageType(msg) {
@@ -366,12 +346,9 @@ function filterText(filters) {
   return Object.keys(labels).map(k => `${filters[k] ? '✅' : '❌'}${labels[k]}`).join('  ');
 }
 
-async function getTasks() {
-  const p = await db();
-  const [rows] = await p.query(
-    'SELECT * FROM forward_tasks WHERE admin_id=? ORDER BY id DESC',
-    [adminId]
-  );
+async function getTasks(userId) {
+  const p=await db();
+  const [rows]=await p.query('SELECT * FROM forward_tasks WHERE admin_id=? ORDER BY id DESC',[Number(userId)]);
   return rows;
 }
 
@@ -477,19 +454,14 @@ function isNotFoundMessage(err) {
 }
 
 async function startHistoryJobs() {
-  const p = await db();
-  const [tasks] = await p.query(
-    'SELECT * FROM forward_tasks WHERE admin_id=? AND status="running" AND history_done=0',
-    [adminId]
-  );
-  for (const task of tasks) {
-    syncTask(task).catch(err => console.error('历史任务异常', task.id, err));
-  }
+  const p=await db();
+  const [tasks]=await p.query('SELECT * FROM forward_tasks WHERE status="running" AND history_done=0 ORDER BY id ASC');
+  for(const task of tasks) syncTask(task).catch(err=>console.error('历史任务异常',task.id,err?.message||err));
 }
 
 async function showTasks(ctx) {
-  const rows = await getTasks();
-  if (!rows.length) return ctx.reply('📋 目前没有转发任务。', menu());
+  const rows = await getTasks(ctx.from.id);
+  if (!rows.length) return ctx.reply('📋 目前没有转发任务。', menu(ctx.from.id));
 
   const lines = rows.map(t => {
     const total = Number(t.history_total || 0);
@@ -505,62 +477,43 @@ async function showTasks(ctx) {
       `实时：${t.realtime ? '开启' : '关闭'}`
     ].join('\n');
   });
-  return ctx.reply('📋 转发任务\n\n' + lines.join('\n\n'), menu());
+  return ctx.reply('📋 转发任务\n\n' + lines.join('\n\n'), menu(ctx.from.id));
 }
 
-bot.start(async ctx => {
-  if (!isAdmin(ctx)) return ctx.reply('机器人已运行。');
-  return ctx.reply('🤖 转发机器人\n\n请选择操作：', menu());
-});
+bot.start(async ctx=>ctx.reply('🤖 Telegram 转发机器人\\n\\n每个用户独立登录自己的 Telegram 账号。\\n登录后可自行设置源频道、目标频道和同步任务。',menu(ctx.from.id)));
+bot.command('menu',async ctx=>ctx.reply('🤖 主菜单',menu(ctx.from.id)));
 
-bot.command('menu', async ctx => {
-  if (!isAdmin(ctx)) return;
-  return ctx.reply('🤖 主菜单', menu());
-});
-
-bot.action('tg_login', async ctx => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
-  const saved = await getTelegramAuth();
-  sessions.set(ctx.from.id, {
-    step: 'tg_api_id',
-    apiId: saved?.api_id ? String(saved.api_id) : '',
-    apiHash: saved?.api_hash || ''
-  });
+bot.action('tg_login',async ctx=>{
+  const uid=Number(ctx.from.id);
   await ctx.answerCbQuery();
-  return ctx.reply(
-    '🔐 Telegram账号登录\\n\\n' +
-    '用于读取源频道/群并进行 MTProto 转发。\\n\\n' +
-    '第1步：发送 Telegram API ID。\\n' +
-    '第2步：发送 Telegram API Hash。\\n' +
-    '第3步：发送手机号。\\n' +
-    '第4步：发送验证码。\\n' +
-    '第5步：如有两步验证，再发送密码。'
-  );
+  if(userClients.has(uid))return ctx.reply('✅ 你的 Telegram 账号已经登录。\\n\\n可以直接添加任务。',menu(uid));
+  if(!TG_API_ID||!TG_API_HASH)return ctx.reply('❌ 服务器尚未配置 TG_API_ID / TG_API_HASH。\\n\\n普通用户不需要填写 API ID/API Hash，请管理员在 VPS 的 .env 中配置一次。');
+  sessions.set(uid,{step:'tg_phone'});
+  return ctx.reply('🔐 Telegram账号登录\\n\\n普通用户无需填写 API ID 和 API Hash。\\n请输入你自己的 Telegram 手机号（含国家区号，例如 +8613812345678）。');
 });
 
-bot.action('tg_logout', async ctx => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
-  const p = await db();
-  await p.query('DELETE FROM telegram_auth WHERE admin_id=?', [adminId]);
-  if (userClient) {
-    try { await userClient.disconnect(); } catch {}
-  }
-  userClient = null;
-  userClientReady = false;
-  sessions.delete(ctx.from.id);
+bot.action('tg_logout',async ctx=>{
+  const uid=Number(ctx.from.id),p=await db();
+  await p.query('DELETE FROM telegram_auth WHERE admin_id=?',[uid]);
+  const client=userClients.get(uid);
+  if(client){try{await client.disconnect();}catch{}}
+  userClients.delete(uid);sessions.delete(uid);
   await ctx.answerCbQuery('已退出');
-  return ctx.reply('🔓 Telegram账号登录已清除。', menu());
+  return ctx.reply('🔓 你的 Telegram 账号已退出。任务记录不会删除。',menu(uid));
 });
 
-bot.action('add_task', async ctx => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
-  sessions.set(ctx.from.id, { step: 'source' });
+bot.action('add_task',async ctx=>{
+  const uid=Number(ctx.from.id);
+  if(!userClients.has(uid)){
+    await ctx.answerCbQuery('请先登录 Telegram');
+    return ctx.reply('❌ 请先点击“🔐 Telegram账号登录”，登录你自己的 Telegram 账号。',menu(uid));
+  }
+  sessions.set(uid,{step:'source'});
   await ctx.answerCbQuery();
-  return ctx.reply('➕ 添加转发任务\n\n请发送【源频道/群】的 ID、@用户名或 t.me 链接。');
+  return ctx.reply('➕ 添加转发任务\\n\\n第1步：发送【源频道/群】的 ID、@用户名或 t.me 链接。\\n第2步：再发送【目标频道/群】。');
 });
 
 bot.action('start_sync', async ctx => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
   const p = await db();
   const [tasks] = await p.query(
     'SELECT * FROM forward_tasks WHERE admin_id=? AND source_chat_id<>target_chat_id AND history_done=0 AND status<>"running"',
@@ -588,16 +541,14 @@ bot.action('start_sync', async ctx => {
 });
 
 bot.action('pause_sync', async ctx => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
   const p = await db();
   await p.query('UPDATE forward_tasks SET status="paused" WHERE admin_id=?', [adminId]);
   await ctx.answerCbQuery('已暂停');
-  return ctx.reply('⏸ 所有历史同步任务已暂停。实时转发开关不受影响。', menu());
+  return ctx.reply('⏸ 所有历史同步任务已暂停。实时转发开关不受影响。', menu(ctx.from.id));
 });
 
 bot.action('realtime', async ctx => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
-  const rows = await getTasks();
+  const rows = await getTasks(ctx.from.id);
   if (!rows.length) return ctx.answerCbQuery('没有任务');
   await ctx.answerCbQuery();
   return ctx.reply(
@@ -612,7 +563,6 @@ bot.action('realtime', async ctx => {
 });
 
 bot.action(/^rt_(\d+)$/, async ctx => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
   const taskId = Number(ctx.match[1]);
   const p = await db();
   const [rows] = await p.query(
@@ -634,16 +584,14 @@ bot.action(/^rt_(\d+)$/, async ctx => {
 });
 
 bot.action('tasks', async ctx => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
   await ctx.answerCbQuery();
   return showTasks(ctx);
 });
 
 bot.action('progress', async ctx => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
   await ctx.answerCbQuery();
-  const rows = await getTasks();
-  if (!rows.length) return ctx.reply('📊 暂无任务。', menu());
+  const rows = await getTasks(ctx.from.id);
+  if (!rows.length) return ctx.reply('📊 暂无任务。', menu(ctx.from.id));
 
   const text = rows.map(t => {
     const total = Number(t.history_total || 0);
@@ -652,12 +600,11 @@ bot.action('progress', async ctx => {
     return `#${t.id}  ${done}/${total}（${percent}%）\n✅ 已处理：${done}  ⏭️ 跳过：${t.history_skipped || 0}  ⚠️ 失败：${t.history_failed || 0}\n状态：${t.status}`;
   }).join('\n\n');
 
-  return ctx.reply('📊 任务进度\n\n' + text, menu());
+  return ctx.reply('📊 任务进度\n\n' + text, menu(ctx.from.id));
 });
 
 bot.action('filters', async ctx => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
-  const rows = await getTasks();
+  const rows = await getTasks(ctx.from.id);
   if (!rows.length) return ctx.answerCbQuery('没有任务');
 
   await ctx.answerCbQuery();
@@ -670,7 +617,6 @@ bot.action('filters', async ctx => {
 });
 
 bot.action(/^filter_task_(\d+)$/, async ctx => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
   const taskId = Number(ctx.match[1]);
   const p = await db();
   const [rows] = await p.query('SELECT * FROM forward_tasks WHERE id=? AND admin_id=?', [taskId, adminId]);
@@ -692,7 +638,6 @@ bot.action(/^filter_task_(\d+)$/, async ctx => {
 });
 
 bot.action(/^ft_(\d+)_(text|photo|video|document|audio|voice|animation|sticker|video_note|other)$/, async ctx => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
   const taskId = Number(ctx.match[1]);
   const type = ctx.match[2];
   const p = await db();
@@ -703,12 +648,11 @@ bot.action(/^ft_(\d+)_(text|photo|video|document|audio|voice|animation|sticker|v
   filters[type] = !filters[type];
   await p.query('UPDATE forward_tasks SET filters_json=? WHERE id=?', [JSON.stringify(filters), taskId]);
   await ctx.answerCbQuery(filters[type] ? '已允许' : '已过滤');
-  return ctx.reply(`🎛 任务 #${taskId}\n\n${filterText(filters)}`, menu());
+  return ctx.reply(`🎛 任务 #${taskId}\n\n${filterText(filters)}`, menu(ctx.from.id));
 });
 
 bot.action('delete_task', async ctx => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
-  const rows = await getTasks();
+  const rows = await getTasks(ctx.from.id);
   if (!rows.length) return ctx.answerCbQuery('没有任务');
   await ctx.answerCbQuery();
   return ctx.reply(
@@ -720,7 +664,6 @@ bot.action('delete_task', async ctx => {
 });
 
 bot.action(/^del_(\d+)$/, async ctx => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
   const taskId = Number(ctx.match[1]);
   const p = await db();
   await p.query('DELETE FROM forwarded_messages WHERE task_id=?', [taskId]);
@@ -729,12 +672,11 @@ bot.action(/^del_(\d+)$/, async ctx => {
     [taskId, adminId]
   );
   await ctx.answerCbQuery(r.affectedRows ? '已删除' : '任务不存在');
-  return ctx.reply(r.affectedRows ? `🗑 任务 #${taskId} 已删除。` : '⚠️ 任务不存在。', menu());
+  return ctx.reply(r.affectedRows ? `🗑 任务 #${taskId} 已删除。` : '⚠️ 任务不存在。', menu(ctx.from.id));
 });
 
 bot.action('set_history', async ctx => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery();
-  const rows = await getTasks();
+  const rows = await getTasks(ctx.from.id);
   if (!rows.length) return ctx.answerCbQuery('没有任务');
   sessions.set(ctx.from.id, { step: 'history_task' });
   await ctx.answerCbQuery();
@@ -742,50 +684,26 @@ bot.action('set_history', async ctx => {
 });
 
 bot.on('text', async (ctx, next) => {
-  if (!isAdmin(ctx)) return next();
-  const session = sessions.get(ctx.from.id);
+  const uid=Number(ctx.from.id);
+  const session = sessions.get(uid);
   if (!session) return next();
 
-  if (session.step === 'tg_api_id') {
-    const apiId = String(ctx.message.text).trim();
-    if (!/^\\d+$/.test(apiId)) return ctx.reply('❌ API ID 必须是数字，请重新发送。');
-    session.apiId = apiId;
-    session.step = 'tg_api_hash';
-    return ctx.reply('第2步：请发送 Telegram API Hash。');
-  }
-
-  if (session.step === 'tg_api_hash') {
-    const apiHash = String(ctx.message.text).trim();
-    if (!/^[A-Za-z0-9_-]{20,}$/.test(apiHash)) return ctx.reply('❌ API Hash 格式不正确，请重新发送。');
-    session.apiHash = apiHash;
-    session.step = 'tg_phone';
-    return ctx.reply('第3步：请发送 Telegram 手机号（含国家区号，例如 +8613812345678）。');
-  }
-
-  if (session.step === 'tg_phone') {
-    const phone = String(ctx.message.text).trim();
-    if (!/^\\+?[1-9]\\d{6,14}$/.test(phone)) return ctx.reply('❌ 手机号格式不正确，请重新发送。');
-    session.phone = phone;
-    runTelegramBotLogin(ctx.from.id).catch(err => {
-      console.error('机器人内 Telegram 登录失败', err?.message || err);
-      sessions.delete(ctx.from.id);
-      bot.telegram.sendMessage(ctx.from.id, `❌ Telegram 登录失败：${err?.message || err}\\n\\n请重新点击“🔐 Telegram账号登录”。`, menu()).catch(() => {});
+  if(session.step==='tg_phone'){
+    const phone=String(ctx.message.text).trim();
+    if(!/^\\+?[1-9]\\d{6,14}$/.test(phone))return ctx.reply('❌ 手机号格式不正确，请重新发送。');
+    session.phone=phone;
+    runTelegramBotLogin(uid).catch(err=>{
+      console.error('用户 Telegram 登录失败',uid,err?.message||err);
+      sessions.delete(uid);
+      bot.telegram.sendMessage(uid,`❌ Telegram 登录失败：${err?.message||err}\\n\\n请重新点击“🔐 Telegram账号登录”。`,menu(uid)).catch(()=>{});
     });
     return ctx.reply('⏳ 正在请求 Telegram 验证码，请稍候……');
   }
-
-  if (session.step === 'tg_code') {
-    const resolve = session.codeResolve;
-    session.codeResolve = null;
-    if (resolve) resolve(String(ctx.message.text).trim());
-    return;
+  if(session.step==='tg_code'){
+    const resolve=session.codeResolve;session.codeResolve=null;if(resolve)resolve(String(ctx.message.text).trim());return;
   }
-
-  if (session.step === 'tg_password') {
-    const resolve = session.passwordResolve;
-    session.passwordResolve = null;
-    if (resolve) resolve(String(ctx.message.text));
-    return;
+  if(session.step==='tg_password'){
+    const resolve=session.passwordResolve;session.passwordResolve=null;if(resolve)resolve(String(ctx.message.text));return;
   }
 
   if (session.step === 'history_task') {
@@ -811,14 +729,14 @@ bot.on('text', async (ctx, next) => {
       [startId, endId, total, taskId]
     );
     sessions.delete(ctx.from.id);
-    return ctx.reply(`✅ 已设置任务 #${taskId}\n历史范围：${startId} → ${endId}\n总数：${total}\n现在点击“▶️ 开始同步”。`, menu());
+    return ctx.reply(`✅ 已设置任务 #${taskId}\n历史范围：${startId} → ${endId}\n总数：${total}\n现在点击“▶️ 开始同步”。`, menu(ctx.from.id));
   }
 
   const chat = cleanChatId(ctx.message.text);
 
   if (session.step === 'source') {
     try {
-      const source = await resolveChatId(chat);
+      const source = await resolveChatId(chat,userClients.get(uid));
       session.source = source;
       session.step = 'target';
       return ctx.reply(`✅ 源已绑定：${source}\n\n现在请发送【目标频道/群】的 ID、@用户名或 t.me 链接。`);
@@ -829,7 +747,7 @@ bot.on('text', async (ctx, next) => {
 
   if (session.step === 'target') {
     try {
-      const target = await resolveChatId(chat);
+      const target = await resolveChatId(chat,userClients.get(uid));
       if (Number(target) === Number(session.source)) {
         return ctx.reply('❌ 源和目标不能相同。\n请重新发送目标频道/群。');
       }
@@ -840,7 +758,7 @@ bot.on('text', async (ctx, next) => {
          (admin_id, source_chat_id, target_chat_id, status, realtime, filters_json)
          VALUES (?, ?, ?, 'paused', 1, ?)
          ON DUPLICATE KEY UPDATE updated_at=CURRENT_TIMESTAMP`,
-        [adminId, session.source, target, JSON.stringify(DEFAULT_FILTERS)]
+        [uid, session.source, target, JSON.stringify(DEFAULT_FILTERS)]
       );
 
       const source = session.source;
@@ -855,53 +773,44 @@ bot.on('text', async (ctx, next) => {
   }
 });
 
-async function waitTelegramInput(userId, step, field, prompt) {
-  const session = sessions.get(userId);
-  if (!session) throw new Error('登录会话已结束');
-  session.step = step;
-  await bot.telegram.sendMessage(userId, prompt);
-  return await new Promise((resolve, reject) => {
-    session[field] = resolve;
-    session.rejectInput = reject;
-  });
+async function waitTelegramInput(userId,step,field,prompt){
+  const session=sessions.get(Number(userId));
+  if(!session)throw new Error('登录会话已结束');
+  session.step=step;
+  await bot.telegram.sendMessage(Number(userId),prompt);
+  return await new Promise((resolve,reject)=>{session[field]=resolve;session.rejectInput=reject;});
 }
 
-async function runTelegramBotLogin(userId) {
-  const session = sessions.get(userId);
-  if (!session) throw new Error('登录会话不存在');
+async function runTelegramBotLogin(userId){
+  const uid=Number(userId),session=sessions.get(uid);
+  if(!session?.phone)throw new Error('登录会话不存在');
+  if(!TG_API_ID||!TG_API_HASH)throw new Error('服务器没有配置 TG_API_ID / TG_API_HASH');
 
-  const client = new TelegramClient(
-    new StringSession(''),
-    Number(session.apiId),
-    session.apiHash,
-    { connectionRetries: 5 }
-  );
-
+  const client=new TelegramClient(new StringSession(''),Number(TG_API_ID),TG_API_HASH,{connectionRetries:5});
   await client.start({
-    phoneNumber: async () => session.phone,
-    phoneCode: async () =>
-      await waitTelegramInput(userId, 'tg_code', 'codeResolve', '📲 第4步：请把 Telegram 收到的验证码发送给我。'),
-    password: async () =>
-      await waitTelegramInput(userId, 'tg_password', 'passwordResolve', '🔐 第5步：请输入 Telegram 两步验证密码。'),
-    onError: err => console.error('Telegram 机器人登录错误：', err?.message || err)
+    phoneNumber:async()=>session.phone,
+    phoneCode:async()=>waitTelegramInput(uid,'tg_code','codeResolve','📲 Telegram 验证码已发送，请把验证码发送给我。'),
+    password:async()=>waitTelegramInput(uid,'tg_password','passwordResolve','🔐 请输入 Telegram 两步验证密码。'),
+    onError:err=>console.error('Telegram 登录错误',uid,err?.message||err)
   });
+  await saveTelegramAuth(uid,TG_API_ID,TG_API_HASH,client.session.save());
+  const old=userClients.get(uid);if(old){try{await old.disconnect();}catch{}}
+  await attachTelegramEvents(client,uid);
+  userClients.set(uid,client);sessions.delete(uid);
+  return bot.telegram.sendMessage(uid,'✅ Telegram账号登录成功！\\n\\n以后你的任务都会使用这个 Telegram 账号执行。\\nVPS 重启后会自动恢复登录状态。',menu(uid));
+}
 
-  const tgSession = client.session.save();
-  await saveTelegramAuth(session.apiId, session.apiHash, tgSession);
-
-  if (userClient) {
-    try { await userClient.disconnect(); } catch {}
+async function restoreAllTelegramClients(){
+  const p=await db();
+  const [rows]=await p.query('SELECT admin_id,api_id,api_hash,tg_session FROM telegram_auth');
+  for(const row of rows){
+    try{await startTelegramUserClient(Number(row.admin_id));console.log(`Telegram账号已恢复：用户 ${row.admin_id}`);}
+    catch(err){console.error(`Telegram账号恢复失败：用户 ${row.admin_id}`,err?.message||err);}
   }
-  userClient = client;
-  await attachTelegramEvents(userClient);
-  userClientReady = true;
-
-  sessions.delete(userId);
-  await bot.telegram.sendMessage(
-    userId,
-    '✅ Telegram账号登录成功！\\n账号已保存到机器人数据库，VPS重启后无需重新登录。',
-    menu()
-  );
+  if(adminId>0&&TG_SESSION&&TG_API_ID&&TG_API_HASH&&!userClients.has(adminId)){
+    try{await saveTelegramAuth(adminId,TG_API_ID,TG_API_HASH,TG_SESSION);await startTelegramUserClient(adminId);}
+    catch(err){console.error('恢复管理员环境变量 Telegram 会话失败',err?.message||err);}
+  }
 }
 
 async function handleRealtimeMessage(ctx, message, chatId) {
@@ -988,7 +897,7 @@ bot.catch(err => console.error('BOT ERROR:', err));
 
 (async () => {
   await db();
-  await startTelegramUserClient();
+  await restoreAllTelegramClients();
   await bot.launch();
   await startHistoryJobs();
   console.log('Telegram 转发机器人已启动');
