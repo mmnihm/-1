@@ -14,6 +14,10 @@ const {
 
 if (!BOT_TOKEN) throw new Error('缺少 BOT_TOKEN');
 if (!ADMIN_ID) throw new Error('缺少 ADMIN_ID');
+if (!MYSQL_HOST) throw new Error('缺少 MYSQL_HOST');
+if (!MYSQL_DATABASE) throw new Error('缺少 MYSQL_DATABASE');
+if (!MYSQL_USER) throw new Error('缺少 MYSQL_USER');
+if (!MYSQL_PASSWORD) throw new Error('缺少 MYSQL_PASSWORD');
 
 const adminId = Number(ADMIN_ID);
 const bot = new Telegraf(BOT_TOKEN);
@@ -366,12 +370,40 @@ bot.action('pause_sync', async ctx => {
 
 bot.action('realtime', async ctx => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  const rows = await getTasks();
+  if (!rows.length) return ctx.answerCbQuery('没有任务');
+  await ctx.answerCbQuery();
+  return ctx.reply(
+    '🔄 实时转发\n请选择要设置的任务：',
+    Markup.inlineKeyboard(rows.map(t => [
+      Markup.button.callback(
+        `#${t.id} ${t.source_chat_id} → ${t.target_chat_id}：${t.realtime ? '开启' : '关闭'}`,
+        `rt_${t.id}`
+      )
+    ]))
+  );
+});
+
+bot.action(/^rt_(\d+)$/, async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  const taskId = Number(ctx.match[1]);
   const p = await db();
-  const [rows] = await p.query('SELECT realtime FROM forward_tasks WHERE admin_id=? ORDER BY id DESC LIMIT 1', [adminId]);
-  const enabled = rows.length ? !Number(rows[0].realtime) : true;
-  await p.query('UPDATE forward_tasks SET realtime=? WHERE admin_id=?', [enabled ? 1 : 0, adminId]);
+  const [rows] = await p.query(
+    'SELECT realtime FROM forward_tasks WHERE id=? AND admin_id=?',
+    [taskId, adminId]
+  );
+  if (!rows.length) return ctx.answerCbQuery('任务不存在');
+
+  const enabled = !Number(rows[0].realtime);
+  await p.query(
+    'UPDATE forward_tasks SET realtime=? WHERE id=? AND admin_id=?',
+    [enabled ? 1 : 0, taskId, adminId]
+  );
   await ctx.answerCbQuery(enabled ? '已开启' : '已关闭');
-  return ctx.reply(`🔄 实时转发已${enabled ? '开启' : '关闭'}。`, menu());
+  return ctx.reply(
+    `🔄 任务 #${taskId} 实时转发已${enabled ? '开启' : '关闭'}。`,
+    menu()
+  );
 });
 
 bot.action('tasks', async ctx => {
@@ -628,8 +660,8 @@ bot.catch(err => console.error('BOT ERROR:', err));
 
 (async () => {
   await db();
-  await startHistoryJobs();
   await bot.launch();
+  await startHistoryJobs();
   console.log('Telegram 转发机器人已启动');
 })();
 
