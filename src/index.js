@@ -1,6 +1,9 @@
 import 'dotenv/config';
 import mysql from 'mysql2/promise';
 import { Telegraf, Markup } from 'telegraf';
+import { TelegramClient } from 'telegram';
+import { StringSession } from 'telegram/sessions/index.js';
+import { NewMessage } from 'telegram/events/index.js';
 
 const {
   BOT_TOKEN,
@@ -9,7 +12,10 @@ const {
   MYSQL_PORT = '3306',
   MYSQL_DATABASE,
   MYSQL_USER,
-  MYSQL_PASSWORD
+  MYSQL_PASSWORD,
+  TG_API_ID,
+  TG_API_HASH,
+  TG_SESSION = ''
 } = process.env;
 
 if (!BOT_TOKEN) throw new Error('缺少 BOT_TOKEN');
@@ -25,6 +31,8 @@ let pool = null;
 const sessions = new Map();
 const runningJobs = new Set();
 const forwardingLocks = new Set();
+let userClient = null;
+let userClientReady = false;
 
 const DEFAULT_FILTERS = {
   text: true,
@@ -105,6 +113,97 @@ async function db() {
     `);
   }
   return pool;
+}
+
+async function startTelegramUserClient() {
+  if (!TG_API_ID || !TG_API_HASH || !TG_SESSION) {
+    console.log('Telegram 账号转发未启用：请设置 TG_API_ID、TG_API_HASH、TG_SESSION');
+    return;
+  }
+
+  try {
+    userClient = new TelegramClient(
+      new StringSession(TG_SESSION),
+      Number(TG_API_ID),
+      TG_API_HASH,
+      { connectionRetries: 5 }
+    );
+    await userClient.connect();
+
+    if (!(await userClient.checkAuthorization())) {
+      throw new Error('TG_SESSION 无效或已失效，请重新生成登录会话');
+    }
+
+    userClient.addEventHandler(async event => {
+      try {
+        const message = event.message;
+        const sourceChatId = message?.chatId != null ? Number(message.chatId) : null;
+        if (!message?.id || sourceChatId == null) return;
+
+        const p = await db();
+        const [tasks] = await p.query(
+          'SELECT * FROM forward_tasks WHERE source_chat_id=? AND realtime=1',
+          [sourceChatId]
+        );
+
+        for (const task of tasks) {
+          if (Number(task.target_chat_id) === sourceChatId) continue;
+          const type = getGramJsMessageType(message);
+          const filters = parseFilters(task.filters_json);
+          if (!filters[type]) continue;
+
+          const lockKey = 'mt:' + String(task.id) + ':' + String(message.id);
+          if (forwardingLocks.has(lockKey)) continue;
+          forwardingLocks.add(lockKey);
+
+          try {
+            if (await isAlreadyForwarded(task.id, Number(message.id))) continue;
+            const target = await userClient.getEntity(Number(task.target_chat_id));
+            const source = await userClient.getEntity(sourceChatId);
+            const result = await userClient.forwardMessages(target, {
+              messages: [Number(message.id)],
+              fromPeer: source
+            });
+            const forwarded = Array.isArray(result) ? result[0] : result;
+            await markForwarded(task.id, Number(message.id), Number(forwarded?.id || 0));
+            await p.query(
+              'UPDATE forward_tasks SET source_message_id=? WHERE id=?',
+              [Number(message.id), task.id]
+            );
+          } catch (err) {
+            console.error('MTProto 实时转发失败', task.id, message.id, err?.message || err);
+            await p.query(
+              'UPDATE forward_tasks SET history_failed=history_failed+1, updated_at=CURRENT_TIMESTAMP WHERE id=?',
+              [task.id]
+            );
+          } finally {
+            forwardingLocks.delete(lockKey);
+          }
+        }
+      } catch (err) {
+        console.error('MTProto 新消息处理失败', err?.message || err);
+      }
+    }, new NewMessage({}));
+
+    userClientReady = true;
+    console.log('Telegram 账号已登录，MTProto 实时转发已启用');
+  } catch (err) {
+    userClientReady = false;
+    console.error('Telegram 账号登录失败：', err?.message || err);
+  }
+}
+
+function getGramJsMessageType(message) {
+  if (message?.message) return 'text';
+  if (message?.photo) return 'photo';
+  if (message?.video) return 'video';
+  if (message?.document) return 'document';
+  if (message?.audio) return 'audio';
+  if (message?.voice) return 'voice';
+  if (message?.gif) return 'animation';
+  if (message?.sticker) return 'sticker';
+  if (message?.videoNote) return 'video_note';
+  return 'other';
 }
 
 function isAdmin(ctx) {
@@ -673,6 +772,7 @@ bot.catch(err => console.error('BOT ERROR:', err));
 
 (async () => {
   await db();
+  await startTelegramUserClient();
   await bot.launch();
   await startHistoryJobs();
   console.log('Telegram 转发机器人已启动');
