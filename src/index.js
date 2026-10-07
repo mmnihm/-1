@@ -31,6 +31,7 @@ let pool = null;
 const sessions = new Map();
 const runningJobs = new Set();
 const forwardingLocks = new Set();
+const albumQueues = new Map();
 let userClient = null;
 let userClientReady = false;
 
@@ -148,36 +149,27 @@ async function startTelegramUserClient() {
 
         for (const task of tasks) {
           if (Number(task.target_chat_id) === sourceChatId) continue;
-          const type = getGramJsMessageType(message);
+
           const filters = parseFilters(task.filters_json);
+          const type = getGramJsMessageType(message);
           if (!filters[type]) continue;
 
-          const lockKey = 'mt:' + String(task.id) + ':' + String(message.id);
-          if (forwardingLocks.has(lockKey)) continue;
-          forwardingLocks.add(lockKey);
-
-          try {
-            if (await isAlreadyForwarded(task.id, Number(message.id))) continue;
-            const target = await userClient.getEntity(Number(task.target_chat_id));
-            const source = await userClient.getEntity(sourceChatId);
-            const result = await userClient.forwardMessages(target, {
-              messages: [Number(message.id)],
-              fromPeer: source
-            });
-            const forwarded = Array.isArray(result) ? result[0] : result;
-            await markForwarded(task.id, Number(message.id), Number(forwarded?.id || 0));
-            await p.query(
-              'UPDATE forward_tasks SET source_message_id=? WHERE id=?',
-              [Number(message.id), task.id]
-            );
-          } catch (err) {
-            console.error('MTProto 实时转发失败', task.id, message.id, err?.message || err);
-            await p.query(
-              'UPDATE forward_tasks SET history_failed=history_failed+1, updated_at=CURRENT_TIMESTAMP WHERE id=?',
-              [task.id]
-            );
-          } finally {
-            forwardingLocks.delete(lockKey);
+          if (message.groupedId != null) {
+            const key = `album:${task.id}:${sourceChatId}:${String(message.groupedId)}`;
+            let queue = albumQueues.get(key);
+            if (!queue) {
+              queue = { task, sourceChatId, ids: new Set(), timer: null };
+              albumQueues.set(key, queue);
+            }
+            queue.ids.add(Number(message.id));
+            if (queue.timer) clearTimeout(queue.timer);
+            queue.timer = setTimeout(() => {
+              forwardTelegramAlbum(key).catch(err =>
+                console.error('MTProto 相册转发失败', task.id, message.groupedId, err?.message || err)
+              );
+            }, 700);
+          } else {
+            await forwardTelegramMessages(task, sourceChatId, [Number(message.id)]);
           }
         }
       } catch (err) {
@@ -190,6 +182,66 @@ async function startTelegramUserClient() {
   } catch (err) {
     userClientReady = false;
     console.error('Telegram 账号登录失败：', err?.message || err);
+  }
+}
+
+async function forwardTelegramAlbum(key) {
+  const queue = albumQueues.get(key);
+  if (!queue) return;
+  albumQueues.delete(key);
+  const ids = [...queue.ids].sort((a, b) => a - b);
+  if (ids.length) await forwardTelegramMessages(queue.task, queue.sourceChatId, ids);
+}
+
+async function forwardTelegramMessages(task, sourceChatId, messageIds) {
+  const p = await db();
+  const pending = [];
+  for (const id of [...new Set(messageIds.map(Number).filter(Boolean))]) {
+    const lockKey = `mt:${task.id}:${id}`;
+    if (forwardingLocks.has(lockKey)) continue;
+    forwardingLocks.add(lockKey);
+    if (await isAlreadyForwarded(task.id, id)) {
+      forwardingLocks.delete(lockKey);
+      continue;
+    }
+    pending.push({ id, lockKey });
+  }
+  if (!pending.length) return;
+
+  try {
+    const target = await userClient.getEntity(Number(task.target_chat_id));
+    const source = await userClient.getEntity(Number(sourceChatId));
+    const result = await userClient.forwardMessages(target, {
+      messages: pending.map(x => x.id),
+      fromPeer: source
+    });
+    const forwarded = Array.isArray(result) ? result : [result];
+
+    for (let i = 0; i < pending.length; i++) {
+      await markForwarded(
+        task.id,
+        pending[i].id,
+        Number(forwarded[i]?.id || 0)
+      );
+    }
+
+    await p.query(
+      'UPDATE forward_tasks SET source_message_id=? WHERE id=?',
+      [pending[pending.length - 1].id, task.id]
+    );
+  } catch (err) {
+    console.error(
+      'MTProto 实时转发失败',
+      task.id,
+      pending.map(x => x.id).join(','),
+      err?.message || err
+    );
+    await p.query(
+      'UPDATE forward_tasks SET history_failed=history_failed+1, updated_at=CURRENT_TIMESTAMP WHERE id=?',
+      [task.id]
+    );
+  } finally {
+    for (const item of pending) forwardingLocks.delete(item.lockKey);
   }
 }
 
