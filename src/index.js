@@ -231,7 +231,7 @@ bot.action('set_history', async ctx => {
   if (!rows.length) return ctx.answerCbQuery('没有任务');
   sessions.set(ctx.from.id, { step: 'history_task', taskId: rows[0].id });
   await ctx.answerCbQuery();
-  return ctx.reply('请发送任务编号和历史结束消息 ID，例如：1 5000');
+  return ctx.reply('请发送：任务编号 起始消息ID 结束消息ID，例如：1 100 5000');
 });
 
 bot.on('text', async ctx => {
@@ -244,19 +244,20 @@ bot.on('text', async ctx => {
   if (session.step === 'history_task') {
     const parts = String(ctx.message.text).trim().split(/\s+/);
     const taskId = Number(parts[0]);
-    const endId = Number(parts[1]);
-    if (!Number.isInteger(taskId) || !Number.isInteger(endId) || endId < 1) {
-      return ctx.reply('格式错误，请发送：任务编号 结束消息ID，例如：1 5000');
+    const startId = Number(parts[1]);
+    const endId = Number(parts[2]);
+    if (!Number.isInteger(taskId) || !Number.isInteger(startId) || !Number.isInteger(endId) || startId < 1 || endId < startId) {
+      return ctx.reply('格式错误，请发送：任务编号 起始ID 结束ID，例如：1 100 5000');
     }
     const p = await db();
     const [rows] = await p.query('SELECT * FROM forward_tasks WHERE id=? AND admin_id=?', [taskId, adminId]);
     if (!rows.length) return ctx.reply('❌ 找不到这个任务。');
     await p.query(
-      'UPDATE forward_tasks SET history_next_id=IF(history_next_id=0,1,history_next_id), history_end_id=?, history_done=0 WHERE id=?',
-      [endId, taskId]
+      'UPDATE forward_tasks SET history_next_id=?, history_end_id=?, history_done=0 WHERE id=?',
+      [startId, endId, taskId]
     );
     sessions.delete(ctx.from.id);
-    return ctx.reply(`✅ 已设置任务 #${taskId} 的历史结束 ID：${endId}\\n现在点击“▶️ 开始同步”。`, menu());
+    return ctx.reply(`✅ 已设置任务 #${taskId}\\n历史范围：${startId} → ${endId}\\n现在点击“▶️ 开始同步”。`, menu());
   }
 
   if (session.step === 'source') {
