@@ -24,6 +24,7 @@ const bot = new Telegraf(BOT_TOKEN);
 let pool = null;
 const sessions = new Map();
 const runningJobs = new Set();
+const forwardingLocks = new Set();
 
 const DEFAULT_FILTERS = {
   text: true,
@@ -338,7 +339,7 @@ bot.action('start_sync', async ctx => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery();
   const p = await db();
   const [tasks] = await p.query(
-    'SELECT * FROM forward_tasks WHERE admin_id=? AND source_chat_id<>target_chat_id',
+    'SELECT * FROM forward_tasks WHERE admin_id=? AND source_chat_id<>target_chat_id AND history_done=0 AND status<>"running"',
     [adminId]
   );
 
@@ -516,10 +517,10 @@ bot.action('set_history', async ctx => {
   return ctx.reply('请发送：任务编号 起始消息ID 结束消息ID，例如：1 100 5000');
 });
 
-bot.on('text', async ctx => {
-  if (!isAdmin(ctx)) return;
+bot.on('text', async (ctx, next) => {
+  if (!isAdmin(ctx)) return next();
   const session = sessions.get(ctx.from.id);
-  if (!session) return;
+  if (!session) return next();
 
   if (session.step === 'history_task') {
     const parts = String(ctx.message.text).trim().split(/\s+/);
@@ -606,9 +607,13 @@ async function handleRealtimeMessage(ctx, message, chatId) {
 
     const filters = parseFilters(task.filters_json);
     if (!filters[type]) continue;
-    if (await isAlreadyForwarded(task.id, message.message_id)) continue;
+
+    const lockKey = String(task.id) + ':' + String(message.message_id);
+    if (forwardingLocks.has(lockKey)) continue;
+    forwardingLocks.add(lockKey);
 
     try {
+      if (await isAlreadyForwarded(task.id, message.message_id)) continue;
       const result = await copyWithRetry(chatId, task.target_chat_id, message.message_id);
       await markForwarded(task.id, message.message_id, result?.message_id || null);
       await p.query(
@@ -617,6 +622,8 @@ async function handleRealtimeMessage(ctx, message, chatId) {
       );
     } catch (err) {
       console.error('实时转发失败', task.id, message.message_id, err?.message || err);
+    } finally {
+      forwardingLocks.delete(lockKey);
     }
   }
 }
