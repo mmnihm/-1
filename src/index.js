@@ -79,8 +79,8 @@ function menu() {
 
 function cleanChatId(value) {
   const s = String(value || '').trim();
-  if (/^-?\\d+$/.test(s)) return Number(s);
-  const m = s.match(/(?:t\\.me\\/|@)([A-Za-z0-9_]+)/);
+  if (/^-?\d+$/.test(s)) return Number(s);
+  const m = s.match(/(?:t\.me\\/|@)([A-Za-z0-9_]+)/);
   return m ? '@' + m[1] : s;
 }
 
@@ -213,7 +213,7 @@ bot.action('delete_task', async ctx => {
   );
 });
 
-bot.action(/^del_(\\d+)$/, async ctx => {
+bot.action(/^del_(\d+)$/, async ctx => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery();
   const taskId = Number(ctx.match[1]);
   const p = await db();
