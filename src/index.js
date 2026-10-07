@@ -50,6 +50,15 @@ async function db() {
         UNIQUE KEY uq_task (admin_id, source_chat_id, target_chat_id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     `);
+    for (const sql of [
+      'ALTER TABLE forward_tasks ADD COLUMN history_next_id BIGINT DEFAULT 0',
+      'ALTER TABLE forward_tasks ADD COLUMN history_end_id BIGINT DEFAULT 0',
+      'ALTER TABLE forward_tasks ADD COLUMN history_done TINYINT(1) NOT NULL DEFAULT 0'
+    ]) {
+      try { await pool.query(sql); } catch (e) {
+        if (e?.code !== 'ER_DUP_FIELDNAME') throw e;
+      }
+    }
   }
   return pool;
 }
@@ -89,8 +98,10 @@ async function syncTask(task) {
   let nextId = Number(task.history_next_id || 0);
   const endId = Number(task.history_end_id || 0);
   if (!nextId || !endId || nextId > endId) return;
-  for (let id = nextId; id <= endId; id++) {
-    const [rows] = await p.query('SELECT status FROM forward_tasks WHERE id=?', [task.id]);
+  while (nextId <= endId) {
+    const batchEnd = Math.min(nextId + 9, endId);
+    for (let id = nextId; id <= batchEnd; id++) {
+      const [rows] = await p.query('SELECT status FROM forward_tasks WHERE id=?', [task.id]);
     if (!rows.length || rows[0].status !== 'running') return;
     try {
       await copyWithRetry(task.source_chat_id, task.target_chat_id, id);
@@ -103,8 +114,9 @@ async function syncTask(task) {
       console.error('历史同步失败', task.id, id, err?.message || err);
       await p.query('UPDATE forward_tasks SET status="paused" WHERE id=?', [task.id]);
       return;
+      }
+      nextId = batchEnd + 1;
     }
-  }
   await p.query('UPDATE forward_tasks SET history_done=1,status="paused" WHERE id=?', [task.id]);
 }
 
@@ -160,6 +172,7 @@ bot.action('start_sync', async ctx => {
     'UPDATE forward_tasks SET status="running" WHERE admin_id=? AND target_chat_id<>source_chat_id',
     [adminId]
   );
+  await startHistoryJobs();
   await ctx.answerCbQuery('已开始');
   return ctx.reply(`▶️ 已启动 ${r.affectedRows} 个同步任务。\\n历史消息同步模块将按断点继续。`, menu());
 });
