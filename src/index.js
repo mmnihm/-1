@@ -520,9 +520,9 @@ bot.on('text', async ctx => {
       const source = await resolveChatId(chat);
       session.source = source;
       session.step = 'target';
-      return ctx.reply(`✅ 源已绑定：${source}\\n\\n现在请发送【目标频道/群】的 ID、@用户名或 t.me 链接。`);
+      return ctx.reply(`✅ 源已绑定：${source}\n\n现在请发送【目标频道/群】的 ID、@用户名或 t.me 链接。`);
     } catch (err) {
-      return ctx.reply(`❌ 无法绑定这个源频道/群。\\n\\n请确认机器人已经加入该频道/群，并且有读取消息的权限。\\n错误：${err?.message || err}`);
+      return ctx.reply(`❌ 无法绑定这个源频道/群。\n\n请确认机器人已经加入该频道/群，并且有读取消息的权限。\n错误：${err?.message || err}`);
     }
   }
 
@@ -530,7 +530,7 @@ bot.on('text', async ctx => {
     try {
       const target = await resolveChatId(chat);
       if (Number(target) === Number(session.source)) {
-        return ctx.reply('❌ 源和目标不能相同。\\n请重新发送目标频道/群。');
+        return ctx.reply('❌ 源和目标不能相同。\n请重新发送目标频道/群。');
       }
 
       const p = await db();
@@ -545,11 +545,11 @@ bot.on('text', async ctx => {
       const source = session.source;
       sessions.delete(ctx.from.id);
       return ctx.reply(
-        `✅ 转发任务已添加\\n\\n源：${source}\\n目标：${target}\\n\\n如需历史消息，请先设置历史范围；实时转发默认开启。`,
+        `✅ 转发任务已添加\n\n源：${source}\n目标：${target}\n\n如需历史消息，请先设置历史范围；实时转发默认开启。`,
         menu()
       );
     } catch (err) {
-      return ctx.reply(`❌ 无法绑定这个目标频道/群。\\n\\n请确认机器人已经加入目标频道/群，并且有发送消息的权限。\\n错误：${err?.message || err}`);
+      return ctx.reply(`❌ 无法绑定这个目标频道/群。\n\n请确认机器人已经加入目标频道/群，并且有发送消息的权限。\n错误：${err?.message || err}`);
     }
   }
 });
