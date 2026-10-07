@@ -514,10 +514,15 @@ bot.action('add_task',async ctx=>{
 });
 
 bot.action('start_sync', async ctx => {
+  const uid = Number(ctx.from.id);
+  if (!userClients.has(uid)) {
+    await ctx.answerCbQuery('请先登录 Telegram');
+    return ctx.reply('❌ 请先登录你的 Telegram 账号。', menu(uid));
+  }
   const p = await db();
   const [tasks] = await p.query(
     'SELECT * FROM forward_tasks WHERE admin_id=? AND source_chat_id<>target_chat_id AND history_done=0 AND status<>"running"',
-    [adminId]
+    [uid]
   );
 
   let started = 0;
@@ -536,15 +541,16 @@ bot.action('start_sync', async ctx => {
     started
       ? `▶️ 已启动 ${started} 个历史同步任务。\n按每批 10 条处理，重启后会从断点继续。`
       : '⚠️ 没有已设置历史范围的任务。\n请先点击“🕘 设置历史范围”。',
-    menu()
+    menu(uid)
   );
 });
 
 bot.action('pause_sync', async ctx => {
+  const uid = Number(ctx.from.id);
   const p = await db();
-  await p.query('UPDATE forward_tasks SET status="paused" WHERE admin_id=?', [adminId]);
+  await p.query('UPDATE forward_tasks SET status="paused" WHERE admin_id=?', [uid]);
   await ctx.answerCbQuery('已暂停');
-  return ctx.reply('⏸ 所有历史同步任务已暂停。实时转发开关不受影响。', menu(ctx.from.id));
+  return ctx.reply('⏸ 你的所有历史同步任务已暂停。实时转发开关不受影响。', menu(uid));
 });
 
 bot.action('realtime', async ctx => {
@@ -567,14 +573,14 @@ bot.action(/^rt_(\d+)$/, async ctx => {
   const p = await db();
   const [rows] = await p.query(
     'SELECT realtime FROM forward_tasks WHERE id=? AND admin_id=?',
-    [taskId, adminId]
+    [taskId, Number(ctx.from.id)]
   );
   if (!rows.length) return ctx.answerCbQuery('任务不存在');
 
   const enabled = !Number(rows[0].realtime);
   await p.query(
     'UPDATE forward_tasks SET realtime=? WHERE id=? AND admin_id=?',
-    [enabled ? 1 : 0, taskId, adminId]
+    [enabled ? 1 : 0, taskId, Number(ctx.from.id)]
   );
   await ctx.answerCbQuery(enabled ? '已开启' : '已关闭');
   return ctx.reply(
@@ -619,7 +625,7 @@ bot.action('filters', async ctx => {
 bot.action(/^filter_task_(\d+)$/, async ctx => {
   const taskId = Number(ctx.match[1]);
   const p = await db();
-  const [rows] = await p.query('SELECT * FROM forward_tasks WHERE id=? AND admin_id=?', [taskId, adminId]);
+  const [rows] = await p.query('SELECT * FROM forward_tasks WHERE id=? AND admin_id=?', [taskId, Number(ctx.from.id)]);
   if (!rows.length) return ctx.answerCbQuery('任务不存在');
 
   const filters = parseFilters(rows[0].filters_json);
@@ -641,7 +647,7 @@ bot.action(/^ft_(\d+)_(text|photo|video|document|audio|voice|animation|sticker|v
   const taskId = Number(ctx.match[1]);
   const type = ctx.match[2];
   const p = await db();
-  const [rows] = await p.query('SELECT filters_json FROM forward_tasks WHERE id=? AND admin_id=?', [taskId, adminId]);
+  const [rows] = await p.query('SELECT filters_json FROM forward_tasks WHERE id=? AND admin_id=?', [taskId, Number(ctx.from.id)]);
   if (!rows.length) return ctx.answerCbQuery('任务不存在');
 
   const filters = parseFilters(rows[0].filters_json);
@@ -669,7 +675,7 @@ bot.action(/^del_(\d+)$/, async ctx => {
   await p.query('DELETE FROM forwarded_messages WHERE task_id=?', [taskId]);
   const [r] = await p.query(
     'DELETE FROM forward_tasks WHERE id=? AND admin_id=?',
-    [taskId, adminId]
+    [taskId, Number(ctx.from.id)]
   );
   await ctx.answerCbQuery(r.affectedRows ? '已删除' : '任务不存在');
   return ctx.reply(r.affectedRows ? `🗑 任务 #${taskId} 已删除。` : '⚠️ 任务不存在。', menu(ctx.from.id));
@@ -717,7 +723,7 @@ bot.on('text', async (ctx, next) => {
     }
 
     const p = await db();
-    const [rows] = await p.query('SELECT * FROM forward_tasks WHERE id=? AND admin_id=?', [taskId, adminId]);
+    const [rows] = await p.query('SELECT * FROM forward_tasks WHERE id=? AND admin_id=?', [taskId, Number(ctx.from.id)]);
     if (!rows.length) return ctx.reply('❌ 找不到这个任务。');
 
     const total = endId - startId + 1;
@@ -900,8 +906,18 @@ bot.catch(err => console.error('BOT ERROR:', err));
   await restoreAllTelegramClients();
   await bot.launch();
   await startHistoryJobs();
-  console.log('Telegram 转发机器人已启动');
+  console.log('Telegram 转发机器人已启动（多用户模式）');
 })();
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+process.once('SIGINT', async () => {
+  for (const client of userClients.values()) {
+    try { await client.disconnect(); } catch {}
+  }
+  bot.stop('SIGINT');
+});
+process.once('SIGTERM', async () => {
+  for (const client of userClients.values()) {
+    try { await client.disconnect(); } catch {}
+  }
+  bot.stop('SIGTERM');
+});
