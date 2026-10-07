@@ -372,78 +372,103 @@ async function markForwarded(taskId, sourceMessageId, targetMessageId) {
 }
 
 async function syncTask(task) {
-  if (runningJobs.has(Number(task.id))) return;
-  runningJobs.add(Number(task.id));
+  const taskId=Number(task.id);
+  const userId=Number(task.admin_id);
+  if(runningJobs.has(taskId))return;
+  runningJobs.add(taskId);
 
-  try {
-    const p = await db();
-    let nextId = Number(task.history_next_id || 0);
-    const endId = Number(task.history_end_id || 0);
-
-    if (!nextId || !endId || nextId > endId) {
-      await p.query('UPDATE forward_tasks SET status="paused" WHERE id=?', [task.id]);
+  try{
+    const client=userClients.get(userId);
+    if(!client){
+      console.error('历史同步暂停：Telegram账号未登录',taskId,userId);
       return;
     }
 
-    while (nextId <= endId) {
-      const [state] = await p.query(
-        'SELECT status, history_next_id FROM forward_tasks WHERE id=?',
-        [task.id]
-      );
-      if (!state.length || state[0].status !== 'running') return;
+    const p=await db();
+    let nextId=Number(task.history_next_id||0);
+    const endId=Number(task.history_end_id||0);
+    if(!nextId||!endId||nextId>endId){
+      await p.query('UPDATE forward_tasks SET status="paused" WHERE id=? AND admin_id=?',[taskId,userId]);
+      return;
+    }
 
-      const batchEnd = Math.min(nextId + 9, endId);
+    const source=await client.getEntity(Number(task.source_chat_id));
+    const target=await client.getEntity(Number(task.target_chat_id));
+    const filters=parseFilters(task.filters_json);
 
-      for (let id = nextId; id <= batchEnd; id++) {
-        const [current] = await p.query(
-          'SELECT status FROM forward_tasks WHERE id=?',
-          [task.id]
-        );
-        if (!current.length || current[0].status !== 'running') return;
+    while(nextId<=endId){
+      const [state]=await p.query('SELECT status FROM forward_tasks WHERE id=? AND admin_id=?',[taskId,userId]);
+      if(!state.length||state[0].status!=='running')return;
 
-        if (await isAlreadyForwarded(task.id, id)) {
-          await p.query(
-            'UPDATE forward_tasks SET history_processed=history_processed+1, history_next_id=? WHERE id=?',
-            [id + 1, task.id]
-          );
-          nextId = id + 1;
+      const batchEnd=Math.min(nextId+9,endId);
+      const ids=[];
+
+      for(let id=nextId;id<=batchEnd;id++){
+        if(await isAlreadyForwarded(taskId,id)){
+          await p.query('UPDATE forward_tasks SET history_processed=history_processed+1,history_skipped=history_skipped+1,history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
           continue;
         }
 
-        try {
-          const result = await copyWithRetry(task.source_chat_id, task.target_chat_id, id);
-          await markForwarded(task.id, id, result?.message_id || null);
-          await p.query(
-            'UPDATE forward_tasks SET history_processed=history_processed+1, history_next_id=? WHERE id=?',
-            [id + 1, task.id]
-          );
-        } catch (err) {
-          if (isNotFoundMessage(err)) {
-            await p.query(
-              'UPDATE forward_tasks SET history_processed=history_processed+1, history_skipped=history_skipped+1, history_next_id=? WHERE id=?',
-              [id + 1, task.id]
-            );
-            nextId = id + 1;
-            continue;
-          }
-
-          console.error('历史同步失败', task.id, id, err?.message || err);
-          await p.query(
-            'UPDATE forward_tasks SET history_failed=history_failed+1,status="paused" WHERE id=?',
-            [task.id]
-          );
-          return;
+        let msg;
+        try{
+          const got=await client.getMessages(source,{ids:[id]});
+          msg=Array.isArray(got)?got[0]:got;
+        }catch(err){
+          console.error('读取历史消息失败',taskId,id,err?.message||err);
+          msg=null;
         }
-        nextId = id + 1;
+
+        if(!msg){
+          await p.query('UPDATE forward_tasks SET history_processed=history_processed+1,history_skipped=history_skipped+1,history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
+          continue;
+        }
+
+        if(!filters[getGramJsMessageType(msg)]){
+          await p.query('UPDATE forward_tasks SET history_processed=history_processed+1,history_skipped=history_skipped+1,history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
+          continue;
+        }
+
+        ids.push(id);
       }
+
+      if(ids.length){
+        try{
+          const out=await client.forwardMessages(target,{messages:ids,fromPeer:source});
+          const arr=Array.isArray(out)?out:[out];
+
+          for(let i=0;i<ids.length;i++){
+            await markForwarded(taskId,ids[i],Number(arr[i]?.id||0));
+            await p.query('UPDATE forward_tasks SET history_processed=history_processed+1,history_next_id=? WHERE id=? AND admin_id=?',[ids[i]+1,taskId,userId]);
+          }
+        }catch(err){
+          console.error('历史批量转发失败，逐条重试',taskId,err?.message||err);
+
+          for(const id of ids){
+            try{
+              const out=await client.forwardMessages(target,{messages:[id],fromPeer:source});
+              const one=Array.isArray(out)?out[0]:out;
+              await markForwarded(taskId,id,Number(one?.id||0));
+              await p.query('UPDATE forward_tasks SET history_processed=history_processed+1,history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
+            }catch(singleErr){
+              console.error('历史单条转发失败',taskId,id,singleErr?.message||singleErr);
+              await p.query('UPDATE forward_tasks SET history_processed=history_processed+1,history_failed=history_failed+1,history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
+            }
+          }
+        }
+      }
+
+      nextId=batchEnd+1;
     }
 
-    await p.query(
-      'UPDATE forward_tasks SET history_done=1,status="paused",history_next_id=history_end_id+1 WHERE id=?',
-      [task.id]
-    );
-  } finally {
-    runningJobs.delete(Number(task.id));
+    await p.query('UPDATE forward_tasks SET history_done=1,status="paused",history_next_id=history_end_id+1 WHERE id=? AND admin_id=?',[taskId,userId]);
+  }catch(err){
+    console.error('历史任务异常',taskId,err?.message||err);
+    try{
+      const p=await db();
+      await p.query('UPDATE forward_tasks SET status="paused",history_failed=history_failed+1 WHERE id=? AND admin_id=?',[taskId,userId]);
+    }catch{}
+  }finally{
+    runningJobs.delete(taskId);
   }
 }
 
