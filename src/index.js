@@ -154,6 +154,18 @@ bot.action('delete_task', async ctx => {
   );
 });
 
+bot.action(/^del_(\\d+)$/, async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  const taskId = Number(ctx.match[1]);
+  const p = await db();
+  const [r] = await p.query(
+    'DELETE FROM forward_tasks WHERE id=? AND admin_id=?',
+    [taskId, adminId]
+  );
+  await ctx.answerCbQuery(r.affectedRows ? '已删除' : '任务不存在');
+  return ctx.reply(r.affectedRows ? `🗑 任务 #${taskId} 已删除。` : '⚠️ 任务不存在。', menu());
+});
+
 bot.on('text', async ctx => {
   if (!isAdmin(ctx)) return;
   const session = sessions.get(ctx.from.id);
