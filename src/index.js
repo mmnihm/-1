@@ -420,12 +420,32 @@ async function ensureTargetForumTopic(client, task, sourceEntity, targetEntity, 
   }
 }
 
+function getFloodWaitSeconds(err) {
+  const text = String(err?.message || err || '');
+  const fromText = text.match(/FLOOD_WAIT_(\d+)/i) || text.match(/A wait of (\d+) seconds/i);
+  const seconds = Number(err?.seconds || err?.retryAfter || fromText?.[1] || 0);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 async function sendTelegramMessagesWithoutSource(client, target, messages, topicResolver = null, replyResolver = null, filters = null) {
   const list = [...messages].filter(Boolean).map(msg => applyContentFiltersToMessage(msg, filters)).filter(Boolean);
   if (!list.length) return [];
 
   const sent = [];
   const albums = new Map();
+  const pushSent = (sourceId, result) => {
+    if (Array.isArray(result)) {
+      result.filter(Boolean).forEach((item, index) => {
+        sent.push({ sourceId: Number(sourceId[index] || sourceId), sent: item });
+      });
+      return;
+    }
+    sent.push({ sourceId: Number(sourceId), sent: result });
+  };
 
   for (const msg of list) {
     const topicId = topicResolver ? await topicResolver(msg) : 0;
@@ -437,7 +457,7 @@ async function sendTelegramMessagesWithoutSource(client, target, messages, topic
       albums.get(key).push({ msg, topicId, replyTo });
     } else {
       try {
-        sent.push(await client.sendMessage(target, {
+        pushSent(msg.id, await client.sendMessage(target, {
           message: msg,
           ...(replyTo > 0 ? { replyTo } : {})
         }));
@@ -445,7 +465,7 @@ async function sendTelegramMessagesWithoutSource(client, target, messages, topic
         if (!msg.media) throw firstErr;
         const buffer = await client.downloadMedia(msg, {});
         if (!buffer) throw firstErr;
-        sent.push(await client.sendFile(target, {
+        pushSent(msg.id, await client.sendFile(target, {
           file: buffer,
           caption: String(msg.message || ''),
           ...(replyTo > 0 ? { replyTo } : {})
@@ -467,12 +487,12 @@ async function sendTelegramMessagesWithoutSource(client, target, messages, topic
           ...(replyTo > 0 ? { replyTo } : {})
         });
         const arr = Array.isArray(result) ? result : [result];
-        sent.push(...arr);
+        pushSent(media.map(item => item.id), arr);
       } catch (albumErr) {
         console.error('相册原媒体发送失败，改用逐条复制', albumErr?.message || albumErr);
         for (const item of media) {
           try {
-            sent.push(await client.sendMessage(target, {
+            pushSent(item.id, await client.sendMessage(target, {
               message: item,
               ...(replyTo > 0 ? { replyTo } : {})
             }));
@@ -480,7 +500,7 @@ async function sendTelegramMessagesWithoutSource(client, target, messages, topic
             if (!item.media) throw itemErr;
             const buffer = await client.downloadMedia(item, {});
             if (!buffer) throw itemErr;
-            sent.push(await client.sendFile(target, {
+            pushSent(item.id, await client.sendFile(target, {
               file: buffer,
               caption: String(item.message || ''),
               ...(replyTo > 0 ? { replyTo } : {})
@@ -491,21 +511,21 @@ async function sendTelegramMessagesWithoutSource(client, target, messages, topic
     } else if (media.length === 1) {
       const item = media[0];
       try {
-        sent.push(await client.sendMessage(target, {
+        pushSent(item.id, await client.sendMessage(target, {
           message: item,
           ...(replyTo > 0 ? { replyTo } : {})
         }));
       } catch (firstErr) {
         const buffer = await client.downloadMedia(item, {});
         if (!buffer) throw firstErr;
-        sent.push(await client.sendFile(target, {
+        pushSent(item.id, await client.sendFile(target, {
           file: buffer,
           caption: String(item.message || ''),
           ...(replyTo > 0 ? { replyTo } : {})
         }));
       }
     } else if (group[0]?.msg) {
-      sent.push(await client.sendMessage(target, {
+      pushSent(group[0].msg.id, await client.sendMessage(target, {
         message: group[0].msg,
         ...(replyTo > 0 ? { replyTo } : {})
       }));
@@ -623,8 +643,11 @@ async function cloneDiscussionComments(client, task, sourceChannel, sourcePostId
       if (parent.length) replyTo = Number(parent[0].target_message_id);
     }
 
+    if (!shouldForwardMessage(comment, filters)) continue;
+    const filteredComment = applyContentFiltersToMessage(comment, filters);
+    if (!filteredComment) continue;
     try {
-      const sent = await sendDiscussionMessage(client, targetInfo.chat, comment, replyTo);
+      const sent = await sendDiscussionMessage(client, targetInfo.chat, filteredComment, replyTo);
       if (!sent?.id) continue;
       await p.query('INSERT IGNORE INTO telegram_discussion_message_maps (task_id,source_chat_id,source_message_id,target_chat_id,target_message_id) VALUES (?,?,?,?,?)',
         [Number(task.id),Number(comment.chatId),Number(comment.id),Number(targetInfo.root.chatId),Number(sent.id)]);
@@ -732,14 +755,16 @@ async function forwardTelegramMessages(task, sourceChatId, messageIds, ownerId) 
       },
       parseFilters(task.filters_json)
     );
-    const forwarded = Array.isArray(result) ? result : [result];
+    const forwardedBySource = new Map(
+      (Array.isArray(result) ? result : []).map(item => [Number(item?.sourceId || 0), Number(item?.sent?.id || 0)])
+    );
 
-    for (let i = 0; i < pending.length; i++) {
-      const targetId = Number(forwarded[i]?.id || 0);
-      await markForwarded(task.id, pending[i].id, targetId);
+    for (const item of pending) {
+      const targetId = forwardedBySource.get(item.id) || 0;
+      await markForwarded(task.id, item.id, targetId);
       if (targetId > 0 && parseFilters(task.filters_json).clone_comments !== false && source?.className === 'Channel') {
-        try { await cloneDiscussionComments(client, task, source, pending[i].id, targetId); }
-        catch (discussionErr) { console.error('实时评论区初始化失败',task.id,pending[i].id,discussionErr?.message||discussionErr); }
+        try { await cloneDiscussionComments(client, task, source, item.id, targetId); }
+        catch (discussionErr) { console.error('实时评论区初始化失败',task.id,item.id,discussionErr?.message||discussionErr); }
       }
     }
 
@@ -748,6 +773,13 @@ async function forwardTelegramMessages(task, sourceChatId, messageIds, ownerId) 
       [pending[pending.length - 1].id, task.id]
     );
   } catch (err) {
+    const wait = getFloodWaitSeconds(err);
+    if (wait > 0 && wait <= 180) {
+      console.error('MTProto 实时转发限流，等待后重试', task.id, wait, err?.message || err);
+      await sleep(wait * 1000 + 500);
+      for (const item of pending) forwardingLocks.delete(item.lockKey);
+      return forwardTelegramMessages(task, sourceChatId, pending.map(item => item.id), ownerId);
+    }
     console.error(
       'MTProto 实时转发失败',
       task.id,
@@ -764,14 +796,14 @@ async function forwardTelegramMessages(task, sourceChatId, messageIds, ownerId) 
 }
 
 function getGramJsMessageType(message) {
-  if (message?.photo) return 'photo';
-  if (message?.video) return 'video';
-  if (message?.document) return 'document';
-  if (message?.audio) return 'audio';
-  if (message?.voice) return 'voice';
-  if (message?.gif) return 'animation';
   if (message?.sticker) return 'sticker';
   if (message?.videoNote) return 'video_note';
+  if (message?.voice) return 'voice';
+  if (message?.gif) return 'animation';
+  if (message?.audio) return 'audio';
+  if (message?.video) return 'video';
+  if (message?.photo) return 'photo';
+  if (message?.document) return 'document';
   if (message?.message) return 'text';
   return 'other';
 }
@@ -813,6 +845,7 @@ function applyContentFiltersToMessage(message, filters) {
 }
 function shouldForwardMessage(message,filters){
   if(!message)return false;
+  if(message.action && !message.message && !message.media) return false;
   if(!filters[getGramJsMessageType(message)])return false;
   return applyContentFiltersToMessage(message,filters)!==null;
 }
@@ -1028,7 +1061,7 @@ async function syncTask(task) {
       for(let id=nextId;id<=batchEnd;id++){
         try{
           if(await isAlreadyForwarded(taskId,id)){
-            await p.query('UPDATE forward_tasks SET history_processed=history_processed+1,history_skipped=history_skipped+1,history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
+            await p.query('UPDATE forward_tasks SET history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
             continue;
           }
 
@@ -1041,17 +1074,28 @@ async function syncTask(task) {
 
           if(!shouldForwardMessage(msg,filters)){
             await p.query('UPDATE forward_tasks SET history_processed=history_processed+1,history_skipped=history_skipped+1,history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
+            await markForwarded(taskId,id,null);
             continue;
           }
 
           let messages=[msg];
           if(msg.groupedId!=null){
             try{
-              const around=await client.getMessages(source,{limit:20,around:Number(msg.id)});
+              const around=await client.getMessages(source,{limit:30,around:Number(msg.id)});
               const album=around.filter(x=>x && x.groupedId!=null && String(x.groupedId)===String(msg.groupedId));
               if(album.length)messages=album.sort((a,b)=>Number(a.id)-Number(b.id));
             }catch(err){
               console.error('历史相册读取失败',taskId,id,err?.message||err);
+            }
+            const fresh=[];
+            for(const item of messages){
+              if(await isAlreadyForwarded(taskId,item.id)) continue;
+              fresh.push(item);
+            }
+            messages=fresh;
+            if(!messages.length){
+              await p.query('UPDATE forward_tasks SET history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
+              continue;
             }
           }
 
@@ -1070,18 +1114,29 @@ async function syncTask(task) {
             filters
           );
 
-          const arr=Array.isArray(out)?out:[out];
-          const sentMessageId=Number(arr.find(Boolean)?.id||0);
-          await markForwarded(taskId,id,sentMessageId);
-          if (sentMessageId > 0 && filters.clone_comments !== false && source.className === 'Channel') {
-            await cloneDiscussionComments(client, task, source, id, sentMessageId);
+          const arr=Array.isArray(out)?out:[];
+          const forwardedBySource=new Map(arr.map(item=>[Number(item?.sourceId||0), Number(item?.sent?.id||0)]));
+          for(const item of messages){
+            const targetId=forwardedBySource.get(Number(item.id))||0;
+            await markForwarded(taskId,item.id,targetId);
+            if(targetId>0 && filters.clone_comments!==false && source.className==='Channel'){
+              await cloneDiscussionComments(client, task, source, item.id, targetId);
+            }
           }
+          const sentMessageId=forwardedBySource.get(id)||0;
           await p.query(
-            'UPDATE forward_tasks SET history_processed=history_processed+1,history_next_id=? WHERE id=? AND admin_id=?',
-            [id+1,taskId,userId]
+            'UPDATE forward_tasks SET history_processed=history_processed+?,history_next_id=? WHERE id=? AND admin_id=?',
+            [messages.length,id+1,taskId,userId]
           );
-          console.log('历史同步完成',taskId,'源消息',id,'目标消息',sentMessageId);
+          console.log('历史同步完成',taskId,'源消息',messages.map(item=>item.id).join(','),'当前目标',sentMessageId);
         }catch(singleErr){
+          const wait=getFloodWaitSeconds(singleErr);
+          if(wait>0 && wait<=180){
+            console.error('历史同步限流，等待后重试',taskId,id,wait,singleErr?.message||singleErr);
+            await sleep(wait*1000+500);
+            id--;
+            continue;
+          }
           console.error('历史单条同步失败，继续下一条',taskId,id,singleErr?.message||singleErr);
           await p.query(
             'UPDATE forward_tasks SET history_processed=history_processed+1,history_failed=history_failed+1,history_next_id=? WHERE id=? AND admin_id=?',
@@ -1968,22 +2023,24 @@ bot.on('message', async ctx => {
 });
 
 async function copyWithRetry(source, target, messageId) {
-  for (;;) {
+  for (let attempt = 0; attempt < 8; attempt++) {
     try {
       return await bot.telegram.copyMessage(target, source, messageId);
     } catch (err) {
       const retryAfter = Number(
         err?.response?.parameters?.retry_after ||
         err?.parameters?.retry_after ||
+        getFloodWaitSeconds(err) ||
         0
       );
-      if (retryAfter > 0) {
-        await new Promise(r => setTimeout(r, retryAfter * 1000 + 500));
+      if (retryAfter > 0 && retryAfter <= 180) {
+        await sleep(retryAfter * 1000 + 500);
         continue;
       }
       throw err;
     }
   }
+  throw new Error('copyMessage 连续限流，已停止重试');
 }
 
 bot.catch(err => console.error('BOT ERROR:', err));
