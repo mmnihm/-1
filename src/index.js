@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import mysql from 'mysql2/promise';
 import { Telegraf, Markup } from 'telegraf';
-import { TelegramClient } from 'telegram';
+import { TelegramClient, Api } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { NewMessage } from 'telegram/events/index.js';
 
@@ -818,31 +818,75 @@ async function runTelegramBotLogin(userId){
   if(!session?.phone)throw new Error('登录会话不存在');
   if(!TG_API_ID||!TG_API_HASH)throw new Error('服务器没有配置 TG_API_ID / TG_API_HASH');
 
+  const phone=session.phone;
   const client=new TelegramClient(new StringSession(''),Number(TG_API_ID),TG_API_HASH,{connectionRetries:10});
-  await bot.telegram.sendMessage(uid,'⏳ 正在连接 Telegram 数据中心，请稍候……');
-  let loginTimer;
-  try {
-    const loginPromise=client.start({
-      phoneNumber:async()=>session.phone,
-      phoneCode:async()=>waitTelegramInput(uid,'tg_code','codeResolve','📲 Telegram 验证码已发送，请把验证码发送给我。\\n\\n如果没有收到，请先检查 Telegram 官方“Telegram”服务消息，而不是反复重新请求。'),
-      password:async()=>waitTelegramInput(uid,'tg_password','passwordResolve','🔐 请输入 Telegram 两步验证密码。'),
-      onError:err=>console.error('Telegram 登录错误',uid,err?.message||err)
-    });
-    const timeoutPromise=new Promise((_,reject)=>{
-      loginTimer=setTimeout(()=>reject(new Error('Telegram 登录请求超过 90 秒仍未进入验证码步骤，请检查服务器到 Telegram 数据中心的连接。')),90000);
-    });
-    await Promise.race([loginPromise,timeoutPromise]);
-  } catch (err) {
-    try { await client.disconnect(); } catch {}
+  try{
+    await bot.telegram.sendMessage(uid,'⏳ 正在连接 Telegram，请稍候……');
+    await client.connect();
+    console.log('Telegram 登录：连接成功',uid);
+
+    if(await client.checkAuthorization()){
+      await saveTelegramAuth(uid,TG_API_ID,TG_API_HASH,client.session.save());
+      await attachTelegramEvents(client,uid);
+      userClients.set(uid,client);
+      sessions.delete(uid);
+      return bot.telegram.sendMessage(uid,'✅ Telegram账号登录成功！\\n\\n以后你的任务都会使用这个 Telegram 账号执行。\\nVPS 重启后会自动恢复登录状态。',menu(uid));
+    }
+
+    console.log('Telegram 登录：开始请求验证码',uid,phone);
+    const sent=await Promise.race([
+      client.sendCode({apiId:Number(TG_API_ID),apiHash:TG_API_HASH},phone),
+      new Promise((_,reject)=>setTimeout(()=>reject(new Error('向 Telegram 请求验证码超过 60 秒仍未返回。')),60000))
+    ]);
+
+    if(!sent?.phoneCodeHash)throw new Error('Telegram 没有返回有效的验证码请求结果。');
+    session.phoneCodeHash=sent.phoneCodeHash;
+    console.log('Telegram 登录：验证码请求成功，等待用户输入',uid);
+
+    const code=await waitTelegramInput(
+      uid,
+      'tg_code',
+      'codeResolve',
+      '📲 Telegram 验证码请求已成功发送。\\n\\n请查看你其他已登录设备里的“Telegram”官方服务消息；如果 Telegram 显示验证码，也可以直接把验证码发给我。'
+    );
+
+    let signedIn=false;
+    try{
+      await client.invoke(new Api.auth.SignIn({
+        phoneNumber:phone,
+        phoneCodeHash:session.phoneCodeHash,
+        phoneCode:String(code).trim()
+      }));
+      signedIn=true;
+    }catch(err){
+      const name=String(err?.errorMessage||err?.message||'');
+      if(!/SESSION_PASSWORD_NEEDED/i.test(name))throw err;
+    }
+
+    if(!signedIn){
+      const password=await waitTelegramInput(
+        uid,
+        'tg_password',
+        'passwordResolve',
+        '🔐 你的 Telegram 账号开启了两步验证，请输入两步验证密码。'
+      );
+      await client.invoke(new Api.auth.CheckPassword({
+        password:await client.computePasswordHash(String(password))
+      }));
+    }
+
+    await saveTelegramAuth(uid,TG_API_ID,TG_API_HASH,client.session.save());
+    const old=userClients.get(uid);
+    if(old){try{await old.disconnect();}catch{}}
+    await attachTelegramEvents(client,uid);
+    userClients.set(uid,client);
+    sessions.delete(uid);
+    console.log('Telegram 登录成功',uid);
+    return bot.telegram.sendMessage(uid,'✅ Telegram账号登录成功！\\n\\n以后你的任务都会使用这个 Telegram 账号执行。\\nVPS 重启后会自动恢复登录状态。',menu(uid));
+  }catch(err){
+    try{await client.disconnect();}catch{}
     throw err;
-  } finally {
-    if(loginTimer)clearTimeout(loginTimer);
   }
-  await saveTelegramAuth(uid,TG_API_ID,TG_API_HASH,client.session.save());
-  const old=userClients.get(uid);if(old){try{await old.disconnect();}catch{}}
-  await attachTelegramEvents(client,uid);
-  userClients.set(uid,client);sessions.delete(uid);
-  return bot.telegram.sendMessage(uid,'✅ Telegram账号登录成功！\\n\\n以后你的任务都会使用这个 Telegram 账号执行。\\nVPS 重启后会自动恢复登录状态。',menu(uid));
 }
 
 async function restoreAllTelegramClients(){
