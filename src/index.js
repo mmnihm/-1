@@ -122,6 +122,29 @@ async function db() {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bot_users (
+        user_id BIGINT PRIMARY KEY,
+        status VARCHAR(20) NOT NULL DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `);
+
+    await pool.query(`
+      INSERT IGNORE INTO bot_users (user_id, status)
+      SELECT admin_id, 'authorized' FROM telegram_auth
+    `);
+    await pool.query(`
+      INSERT IGNORE INTO bot_users (user_id, status)
+      SELECT admin_id, 'authorized' FROM forward_tasks
+    `);
+    await pool.query(
+      `INSERT INTO bot_users (user_id, status) VALUES (?, 'authorized')
+       ON DUPLICATE KEY UPDATE status=IF(status='disabled', status, 'authorized')`,
+      [adminId]
+    );
   }
   return pool;
 }
@@ -321,6 +344,74 @@ function isAdmin(ctx) {
   return Number(ctx.from?.id) === adminId;
 }
 
+async function ensureBotUser(userId) {
+  const uid = Number(userId);
+  const p = await db();
+  const [rows] = await p.query('SELECT status FROM bot_users WHERE user_id=? LIMIT 1', [uid]);
+  if (!rows.length) {
+    await p.query('INSERT INTO bot_users (user_id, status) VALUES (?, ?)', [uid, uid === adminId ? 'authorized' : 'pending']);
+    return uid === adminId ? 'authorized' : 'pending';
+  }
+  if (uid === adminId && rows[0].status !== 'authorized') {
+    await p.query('UPDATE bot_users SET status="authorized" WHERE user_id=?', [uid]);
+    return 'authorized';
+  }
+  return String(rows[0].status);
+}
+
+async function forceLogoutUser(userId) {
+  const uid = Number(userId);
+  sessions.delete(uid);
+  const client = userClients.get(uid);
+  if (client) {
+    try { await client.disconnect(); } catch {}
+  }
+  userClients.delete(uid);
+  const p = await db();
+  await p.query('DELETE FROM telegram_auth WHERE admin_id=?', [uid]);
+}
+
+async function getManagedUsers() {
+  const p = await db();
+  const [rows] = await p.query(
+    `SELECT u.user_id, u.status, u.created_at, u.updated_at,
+            EXISTS(SELECT 1 FROM telegram_auth a WHERE a.admin_id=u.user_id) AS logged_in,
+            (SELECT COUNT(*) FROM forward_tasks t WHERE t.admin_id=u.user_id) AS task_count
+     FROM bot_users u
+     ORDER BY FIELD(u.status,'pending','authorized','disabled'), u.updated_at DESC
+     LIMIT 100`
+  );
+  return rows;
+}
+
+bot.use(async (ctx, next) => {
+  if (!ctx.from?.id) return next();
+  const chatType = ctx.chat?.type;
+  if (ctx.updateType !== 'callback_query' && chatType !== 'private') return next();
+
+  const uid = Number(ctx.from.id);
+  const status = await ensureBotUser(uid);
+  if (status === 'authorized') return next();
+
+  if (status === 'pending' && uid !== adminId) {
+    try {
+      await bot.telegram.sendMessage(
+        adminId,
+        `🔔 新用户请求使用转发机器人\n用户 ID：${uid}\n\n请进入“👑 用户管理”授权后才能使用。`
+      );
+    } catch {}
+  }
+
+  if (ctx.updateType === 'callback_query') {
+    try { await ctx.answerCbQuery('⛔ 暂无使用权限'); } catch {}
+  }
+  return ctx.reply(
+    status === 'disabled'
+      ? '🚫 你的账号已被管理员禁用。'
+      : `⛔ 暂未获得使用权限。\n\n你的 Telegram 用户 ID：${uid}\n请把这个 ID 发给机器人管理员申请授权。`
+  );
+});
+
 function menu(userId) {
   const loggedIn=userClients.has(Number(userId));
   return Markup.inlineKeyboard([
@@ -331,7 +422,8 @@ function menu(userId) {
     [Markup.button.callback('🔄 实时转发','realtime'),Markup.button.callback('⚙️ 同步设置','sync_settings')],
     [Markup.button.callback('🎛 过滤设置','filters'),Markup.button.callback('📊 任务进度','progress')],
     [Markup.button.callback('📋 我的任务','tasks'),Markup.button.callback('🗑 删除任务','delete_task')],
-    ...(loggedIn?[[Markup.button.callback('🔓 退出 Telegram账号','tg_logout')]]:[])
+    ...(loggedIn?[[Markup.button.callback('🔓 退出 Telegram账号','tg_logout')]]:[]),
+    ...(Number(userId) === adminId?[[Markup.button.callback('👑 用户管理','admin_users')]]:[])
   ]);
 }
 
@@ -589,6 +681,129 @@ async function showTasks(ctx) {
   });
   return ctx.reply('📋 转发任务\n\n' + lines.join('\n\n'), menu(ctx.from.id));
 }
+
+
+bot.action('admin_users', async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('无权限');
+  const rows = await getManagedUsers();
+  await ctx.answerCbQuery();
+  const pending = rows.filter(r => r.status === 'pending').length;
+  const authorized = rows.filter(r => r.status === 'authorized').length;
+  const disabled = rows.filter(r => r.status === 'disabled').length;
+  const buttons = rows.map(r => [
+    Markup.button.callback(
+      `${r.status === 'pending' ? '⏳' : r.status === 'authorized' ? '✅' : '🚫'} ${r.user_id}｜任务 ${r.task_count}${Number(r.logged_in) ? '｜已登录' : ''}`,
+      `admin_user_${r.user_id}`
+    )
+  ]);
+  buttons.push([Markup.button.callback('➕ 授权用户','admin_authorize_prompt')]);
+  buttons.push([Markup.button.callback('🏠 返回主页','menu_back')]);
+  return ctx.reply(
+    `👑 用户管理\n\n⏳ 待授权：${pending}\n✅ 已授权：${authorized}\n🚫 已禁用：${disabled}\n\n点击用户可管理权限。`,
+    Markup.inlineKeyboard(buttons)
+  );
+});
+
+bot.action('admin_authorize_prompt', async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('无权限');
+  sessions.set(adminId, { step: 'admin_authorize_user' });
+  await ctx.answerCbQuery();
+  return ctx.reply('➕ 授权用户\n\n请发送对方的 Telegram 用户 ID。');
+});
+
+bot.action(/^admin_user_(\d+)$/, async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('无权限');
+  const uid = Number(ctx.match[1]);
+  if (uid === adminId) return ctx.answerCbQuery('管理员不能操作');
+  const p = await db();
+  const [rows] = await p.query(
+    `SELECT u.user_id,u.status,
+            EXISTS(SELECT 1 FROM telegram_auth a WHERE a.admin_id=u.user_id) AS logged_in,
+            (SELECT COUNT(*) FROM forward_tasks t WHERE t.admin_id=u.user_id) AS task_count
+     FROM bot_users u WHERE u.user_id=? LIMIT 1`,
+    [uid]
+  );
+  if (!rows.length) return ctx.answerCbQuery('用户不存在');
+  const u = rows[0];
+  const buttons = [];
+  if (u.status === 'authorized') {
+    buttons.push([Markup.button.callback('🚫 禁用用户', `admin_disable_${uid}`)]);
+    if (Number(u.logged_in)) buttons.push([Markup.button.callback('🔌 强制退出 Telegram', `admin_logout_${uid}`)]);
+  } else {
+    buttons.push([Markup.button.callback('✅ 授权用户', `admin_enable_${uid}`)]);
+  }
+  buttons.push([Markup.button.callback('🗑 移除用户', `admin_remove_${uid}`)]);
+  buttons.push([Markup.button.callback('⬅️ 返回用户列表','admin_users')]);
+  return ctx.reply(
+    `👤 用户：${uid}\n状态：${u.status === 'authorized' ? '✅ 已授权' : u.status === 'disabled' ? '🚫 已禁用' : '⏳ 待授权'}\nTelegram 登录：${Number(u.logged_in) ? '✅ 是' : '❌ 否'}\n任务数量：${u.task_count}`,
+    Markup.inlineKeyboard(buttons)
+  );
+});
+
+bot.action(/^admin_enable_(\d+)$/, async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('无权限');
+  const uid = Number(ctx.match[1]);
+  if (uid === adminId) return ctx.answerCbQuery('管理员不能操作');
+  const p = await db();
+  await p.query(
+    `INSERT INTO bot_users (user_id,status) VALUES (?, 'authorized')
+     ON DUPLICATE KEY UPDATE status='authorized'`,
+    [uid]
+  );
+  await ctx.answerCbQuery('已授权');
+  try { await bot.telegram.sendMessage(uid, '✅ 管理员已授权你使用此转发机器人，现在可以发送 /start。'); } catch {}
+  return ctx.reply('✅ 用户 ' + uid + ' 已授权。', Markup.inlineKeyboard([
+    [Markup.button.callback('⬅️ 返回用户列表','admin_users')],
+    [Markup.button.callback('🏠 返回主页','menu_back')]
+  ]));
+});
+
+bot.action(/^admin_disable_(\d+)$/, async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('无权限');
+  const uid = Number(ctx.match[1]);
+  if (uid === adminId) return ctx.answerCbQuery('管理员不能操作');
+  const p = await db();
+  await p.query(
+    `INSERT INTO bot_users (user_id,status) VALUES (?, 'disabled')
+     ON DUPLICATE KEY UPDATE status='disabled'`,
+    [uid]
+  );
+  await forceLogoutUser(uid);
+  await ctx.answerCbQuery('已禁用并退出 Telegram');
+  try { await bot.telegram.sendMessage(uid, '🚫 管理员已禁用你的使用权限，并退出了你的 Telegram 登录。'); } catch {}
+  return ctx.reply('🚫 用户 ' + uid + ' 已禁用。', Markup.inlineKeyboard([
+    [Markup.button.callback('⬅️ 返回用户列表','admin_users')],
+    [Markup.button.callback('🏠 返回主页','menu_back')]
+  ]));
+});
+
+bot.action(/^admin_logout_(\d+)$/, async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('无权限');
+  const uid = Number(ctx.match[1]);
+  if (uid === adminId) return ctx.answerCbQuery('管理员不能操作');
+  await forceLogoutUser(uid);
+  await ctx.answerCbQuery('已强制退出');
+  try { await bot.telegram.sendMessage(uid, '🔌 管理员已强制退出你的 Telegram 登录。任务不会删除。'); } catch {}
+  return ctx.reply('🔌 用户 ' + uid + ' 已强制退出 Telegram。', Markup.inlineKeyboard([
+    [Markup.button.callback('⬅️ 返回用户列表','admin_users')],
+    [Markup.button.callback('🏠 返回主页','menu_back')]
+  ]));
+});
+
+bot.action(/^admin_remove_(\d+)$/, async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('无权限');
+  const uid = Number(ctx.match[1]);
+  if (uid === adminId) return ctx.answerCbQuery('管理员不能操作');
+  await forceLogoutUser(uid);
+  const p = await db();
+  await p.query('DELETE FROM bot_users WHERE user_id=?', [uid]);
+  await ctx.answerCbQuery('已移除');
+  try { await bot.telegram.sendMessage(uid, '🗑 你已被管理员从转发机器人的用户列表移除。'); } catch {}
+  return ctx.reply('🗑 用户 ' + uid + ' 已移除。', Markup.inlineKeyboard([
+    [Markup.button.callback('⬅️ 返回用户列表','admin_users')],
+    [Markup.button.callback('🏠 返回主页','menu_back')]
+  ]));
+});
 
 bot.start(async ctx=>ctx.reply('🤖 Telegram 转发机器人\n\n每个用户独立登录自己的 Telegram 账号。\n登录后可自行设置源频道、目标频道和同步任务。',menu(ctx.from.id)));
 bot.command('menu',async ctx=>ctx.reply('🤖 主菜单',menu(ctx.from.id)));
@@ -906,6 +1121,27 @@ bot.action(/^history_task_(\d+)$/, async ctx => {
 
 bot.on('text', async (ctx, next) => {
   const uid=Number(ctx.from.id);
+
+  if (session?.step === 'admin_authorize_user') {
+    if (uid !== adminId) {
+      sessions.delete(uid);
+      return ctx.reply('⛔ 无权限。');
+    }
+    const targetId = Number(String(ctx.message.text || '').trim());
+    if (!Number.isSafeInteger(targetId) || targetId <= 0) {
+      return ctx.reply('❌ 用户 ID 格式不正确，请重新发送数字 ID。');
+    }
+    const p = await db();
+    await p.query(
+      `INSERT INTO bot_users (user_id,status) VALUES (?, 'authorized')
+       ON DUPLICATE KEY UPDATE status='authorized'`,
+      [targetId]
+    );
+    sessions.delete(uid);
+    try { await bot.telegram.sendMessage(targetId, '✅ 管理员已授权你使用此转发机器人，现在可以发送 /start。'); } catch {}
+    return ctx.reply(`✅ 用户 ${targetId} 已授权。\n\n你可以继续在“👑 用户管理”里管理其他用户。`, menu(uid));
+  }
+
   const session = sessions.get(uid);
   if (!session) return next();
 
@@ -1016,7 +1252,7 @@ bot.on('text', async (ctx, next) => {
       sessions.delete(ctx.from.id);
       return ctx.reply(
         `✅ 转发任务已添加\n\n源：${source}\n目标：${target}\n\n如需历史消息，请先设置历史范围；实时转发默认开启。`,
-        menu()
+        menu(ctx.from.id)
       );
     } catch (err) {
       return ctx.reply(`❌ 无法绑定这个目标频道/群。\n\n请确认机器人已经加入目标频道/群，并且有发送消息的权限。\n错误：${err?.message || err}`);
@@ -1110,7 +1346,10 @@ async function runTelegramBotLogin(userId){
 
 async function restoreAllTelegramClients(){
   const p=await db();
-  const [rows]=await p.query('SELECT admin_id,api_id,api_hash,tg_session FROM telegram_auth');
+  const [rows]=await p.query(`SELECT a.admin_id,a.api_id,a.api_hash,a.tg_session
+    FROM telegram_auth a
+    LEFT JOIN bot_users u ON u.user_id=a.admin_id
+    WHERE a.admin_id=? OR u.status='authorized'`, [adminId]);
   for(const row of rows){
     try{await startTelegramUserClient(Number(row.admin_id));console.log(`Telegram账号已恢复：用户 ${row.admin_id}`);}
     catch(err){console.error(`Telegram账号恢复失败：用户 ${row.admin_id}`,err?.message||err);}
