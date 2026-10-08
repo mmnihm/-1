@@ -394,12 +394,12 @@ async function sendTelegramMessagesWithoutSource(client, target, messages, topic
       sent.push(await client.sendFile(target, {
         file: media[0].media,
         caption: String(media[0].message || ''),
-        ...(topicId > 0 ? { replyTo: topicId } : {})
+        ...(replyTo > 0 ? { replyTo } : {})
       }));
     } else if (group[0]?.msg?.message) {
       sent.push(await client.sendMessage(target, {
         message: String(group[0].msg.message),
-        ...(topicId > 0 ? { replyTo: topicId } : {})
+        ...(replyTo > 0 ? { replyTo } : {})
       }));
     }
   }
