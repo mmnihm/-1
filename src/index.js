@@ -818,13 +818,26 @@ async function runTelegramBotLogin(userId){
   if(!session?.phone)throw new Error('登录会话不存在');
   if(!TG_API_ID||!TG_API_HASH)throw new Error('服务器没有配置 TG_API_ID / TG_API_HASH');
 
-  const client=new TelegramClient(new StringSession(''),Number(TG_API_ID),TG_API_HASH,{connectionRetries:5});
-  await client.start({
-    phoneNumber:async()=>session.phone,
-    phoneCode:async()=>waitTelegramInput(uid,'tg_code','codeResolve','📲 Telegram 验证码已发送，请把验证码发送给我。'),
-    password:async()=>waitTelegramInput(uid,'tg_password','passwordResolve','🔐 请输入 Telegram 两步验证密码。'),
-    onError:err=>console.error('Telegram 登录错误',uid,err?.message||err)
-  });
+  const client=new TelegramClient(new StringSession(''),Number(TG_API_ID),TG_API_HASH,{connectionRetries:10});
+  await bot.telegram.sendMessage(uid,'⏳ 正在连接 Telegram 数据中心，请稍候……');
+  let loginTimer;
+  try {
+    const loginPromise=client.start({
+      phoneNumber:async()=>session.phone,
+      phoneCode:async()=>waitTelegramInput(uid,'tg_code','codeResolve','📲 Telegram 验证码已发送，请把验证码发送给我。\\n\\n如果没有收到，请先检查 Telegram 官方“Telegram”服务消息，而不是反复重新请求。'),
+      password:async()=>waitTelegramInput(uid,'tg_password','passwordResolve','🔐 请输入 Telegram 两步验证密码。'),
+      onError:err=>console.error('Telegram 登录错误',uid,err?.message||err)
+    });
+    const timeoutPromise=new Promise((_,reject)=>{
+      loginTimer=setTimeout(()=>reject(new Error('Telegram 登录请求超过 90 秒仍未进入验证码步骤，请检查服务器到 Telegram 数据中心的连接。')),90000);
+    });
+    await Promise.race([loginPromise,timeoutPromise]);
+  } catch (err) {
+    try { await client.disconnect(); } catch {}
+    throw err;
+  } finally {
+    if(loginTimer)clearTimeout(loginTimer);
+  }
   await saveTelegramAuth(uid,TG_API_ID,TG_API_HASH,client.session.save());
   const old=userClients.get(uid);if(old){try{await old.disconnect();}catch{}}
   await attachTelegramEvents(client,uid);
