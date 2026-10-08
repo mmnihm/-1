@@ -644,7 +644,7 @@ async function forwardDiscussionRealtime(task, sourceChatId, messageId, ownerId)
 
   try {
     const targetChat = await client.getEntity(Number(map.target_discussion_chat_id));
-    const sent = await sendDiscussionMessage(client,targetChat,message,replyTo);
+    const sent = await sendDiscussionMessage(client,targetChat,applyReplaceRulesToMessage(message,parseFilters(task.filters_json)),replyTo);
     if (!sent?.id) return;
     await p.query(
       'INSERT IGNORE INTO telegram_discussion_message_maps (task_id,source_chat_id,source_message_id,target_chat_id,target_message_id) VALUES (?,?,?,?,?)',
@@ -692,7 +692,8 @@ async function forwardTelegramMessages(task, sourceChatId, messageIds, ownerId) 
         const sourceReplyId = getDirectReplyMessageId(msg, getForumTopicId(msg));
         if (!sourceReplyId) return 0;
         return await getForwardedTargetMessageId(task.id, sourceReplyId);
-      }
+      },
+      parseFilters(task.filters_json)
     );
     const forwarded = Array.isArray(result) ? result : [result];
 
@@ -1005,7 +1006,8 @@ async function syncTask(task) {
               const sourceReplyId=getDirectReplyMessageId(item,getForumTopicId(item));
               if(!sourceReplyId)return 0;
               return await getForwardedTargetMessageId(taskId,sourceReplyId);
-            }
+            },
+            filters
           );
 
           const arr=Array.isArray(out)?out:[out];
