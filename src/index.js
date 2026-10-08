@@ -910,7 +910,7 @@ bot.action(/^rt_(\d+)$/, async ctx => {
   await ctx.answerCbQuery(enabled ? '已开启' : '已关闭');
   return ctx.reply(
     `🔄 任务 #${taskId} 实时转发已${enabled ? '开启' : '关闭'}。`,
-    menu()
+    menu(ctx.from.id)
   );
 });
 
