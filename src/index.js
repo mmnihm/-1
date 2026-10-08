@@ -706,12 +706,51 @@ bot.action(/^del_(\d+)$/, async ctx => {
   return ctx.reply(r.affectedRows ? `🗑 任务 #${taskId} 已删除。` : '⚠️ 任务不存在。', menu(ctx.from.id));
 });
 
+
+function extractHistoryMessageId(message) {
+  const origin = message?.forward_origin;
+  if (origin?.type === 'channel' && Number(origin.message_id) > 0) return Number(origin.message_id);
+  if (Number(message?.forward_from_message_id) > 0) return Number(message.forward_from_message_id);
+  return null;
+}
+
+function extractHistoryIdsFromText(text) {
+  const value = String(text || '').trim();
+  const ids = [];
+  const linkRe = /https?:\/\/t\.me\/(?:c\/\d+|[A-Za-z0-9_]+)\/(\d+)/gi;
+  for (const match of value.matchAll(linkRe)) {
+    const id = Number(match[1]);
+    if (Number.isInteger(id) && id > 0) ids.push(id);
+  }
+  if (ids.length) return [...new Set(ids)];
+  const nums = value.split(/\s+/).filter(Boolean).map(Number);
+  if (nums.length && nums.every(Number.isInteger) && nums.every(n => n > 0)) return [...new Set(nums)];
+  return [];
+}
+
 bot.action('set_history', async ctx => {
   const rows = await getTasks(ctx.from.id);
   if (!rows.length) return ctx.answerCbQuery('没有任务');
-  sessions.set(ctx.from.id, { step: 'history_task' });
   await ctx.answerCbQuery();
-  return ctx.reply('请发送：任务编号 起始消息ID 结束消息ID，例如：1 100 5000');
+  return ctx.reply(
+    '🕘 设置历史范围\\n\\n先选择要设置的任务：',
+    Markup.inlineKeyboard(rows.map(t => [
+      Markup.button.callback(`#${t.id} ${t.source_chat_id} → ${t.target_chat_id}`, `history_task_${t.id}`)
+    ]))
+  );
+});
+
+bot.action(/^history_task_(\d+)$/, async ctx => {
+  const taskId = Number(ctx.match[1]);
+  const uid = Number(ctx.from.id);
+  const p = await db();
+  const [rows] = await p.query('SELECT * FROM forward_tasks WHERE id=? AND admin_id=?', [taskId, uid]);
+  if (!rows.length) return ctx.answerCbQuery('任务不存在');
+  sessions.set(uid, { step: 'history_start', taskId });
+  await ctx.answerCbQuery();
+  return ctx.reply(
+    '🕘 设置历史范围\\n\\n请发送【起始消息】。\\n\\n支持：\\n• 直接转发源频道的一条消息给我\\n• 粘贴消息链接\\n• 直接发送消息 ID\\n\\n收到起点后，我再让你发送结束消息。'
+  );
 });
 
 bot.on('text', async (ctx, next) => {
@@ -738,30 +777,59 @@ bot.on('text', async (ctx, next) => {
     const resolve=session.passwordResolve;session.passwordResolve=null;if(resolve)resolve(String(ctx.message.text));return;
   }
 
-  if (session.step === 'history_task') {
-    const parts = String(ctx.message.text).trim().split(/\s+/);
-    const taskId = Number(parts[0]);
-    const startId = Number(parts[1]);
-    const endId = Number(parts[2]);
 
-    if (!Number.isInteger(taskId) || !Number.isInteger(startId) || !Number.isInteger(endId) || startId < 1 || endId < startId) {
-      return ctx.reply('格式错误，请发送：任务编号 起始ID 结束ID，例如：1 100 5000');
+  if (session.step === 'history_start' || session.step === 'history_end') {
+    const forwardedId = extractHistoryMessageId(ctx.message);
+    const ids = forwardedId ? [forwardedId] : extractHistoryIdsFromText(ctx.message.text);
+    if (!ids.length) {
+      return ctx.reply('❌ 没识别到消息。请直接转发源频道消息、粘贴 t.me 消息链接，或发送消息 ID。');
     }
 
+    const taskId = Number(session.taskId);
     const p = await db();
-    const [rows] = await p.query('SELECT * FROM forward_tasks WHERE id=? AND admin_id=?', [taskId, Number(ctx.from.id)]);
-    if (!rows.length) return ctx.reply('❌ 找不到这个任务。');
+    const [rows] = await p.query('SELECT * FROM forward_tasks WHERE id=? AND admin_id=?', [taskId, uid]);
+    if (!rows.length) {
+      sessions.delete(uid);
+      return ctx.reply('❌ 找不到这个任务。', menu(uid));
+    }
+
+    if (session.step === 'history_start') {
+      if (ids.length >= 2) {
+        const startId = Number(ids[0]);
+        const endId = Number(ids[1]);
+        if (endId < startId) return ctx.reply('❌ 结束消息不能小于起始消息，请重新发送。');
+        const total = endId - startId + 1;
+        await p.query(
+          `UPDATE forward_tasks
+           SET history_next_id=?, history_end_id=?, history_total=?, history_processed=0,
+               history_skipped=0, history_failed=0, history_done=0, status="paused"
+           WHERE id=? AND admin_id=?`,
+          [startId, endId, total, taskId, uid]
+        );
+        sessions.delete(uid);
+        return ctx.reply(`✅ 已设置任务 #${taskId}\\n历史范围：${startId} → ${endId}\\n总数：${total}\\n\\n现在点击“▶️ 开始同步”。`, menu(uid));
+      }
+      session.historyStartId = Number(ids[0]);
+      session.step = 'history_end';
+      return ctx.reply(`✅ 已收到起始消息：${session.historyStartId}\\n\\n现在请发送【结束消息】：\\n• 直接转发一条源频道消息\\n• 粘贴消息链接\\n• 发送消息 ID`);
+    }
+
+    const startId = Number(session.historyStartId);
+    const endId = Number(ids[0]);
+    if (!Number.isInteger(startId) || !Number.isInteger(endId) || startId < 1 || endId < startId) {
+      return ctx.reply(`❌ 结束消息必须不小于起始消息（当前起点：${startId}）。请重新发送结束消息。`);
+    }
 
     const total = endId - startId + 1;
     await p.query(
       `UPDATE forward_tasks
        SET history_next_id=?, history_end_id=?, history_total=?, history_processed=0,
            history_skipped=0, history_failed=0, history_done=0, status="paused"
-       WHERE id=?`,
-      [startId, endId, total, taskId]
+       WHERE id=? AND admin_id=?`,
+      [startId, endId, total, taskId, uid]
     );
-    sessions.delete(ctx.from.id);
-    return ctx.reply(`✅ 已设置任务 #${taskId}\n历史范围：${startId} → ${endId}\n总数：${total}\n现在点击“▶️ 开始同步”。`, menu(ctx.from.id));
+    sessions.delete(uid);
+    return ctx.reply(`✅ 已设置任务 #${taskId}\\n历史范围：${startId} → ${endId}\\n总数：${total}\\n\\n现在点击“▶️ 开始同步”。`, menu(uid));
   }
 
   const chat = cleanChatId(ctx.message.text);
