@@ -709,109 +709,65 @@ async function syncTask(task) {
       if(!state.length||state[0].status!=='running')return;
 
       const batchEnd=Math.min(nextId+9,endId);
-      const ids=[];
 
       for(let id=nextId;id<=batchEnd;id++){
-        if(await isAlreadyForwarded(taskId,id)){
-          await p.query('UPDATE forward_tasks SET history_processed=history_processed+1,history_skipped=history_skipped+1,history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
-          continue;
-        }
-
-        let msg;
         try{
+          if(await isAlreadyForwarded(taskId,id)){
+            await p.query('UPDATE forward_tasks SET history_processed=history_processed+1,history_skipped=history_skipped+1,history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
+            continue;
+          }
+
           const got=await client.getMessages(source,{ids:[id]});
-          msg=Array.isArray(got)?got[0]:got;
-        }catch(err){
-          console.error('读取历史消息失败',taskId,id,err?.message||err);
-          msg=null;
-        }
+          const msg=Array.isArray(got)?got[0]:got;
+          if(!msg){
+            await p.query('UPDATE forward_tasks SET history_processed=history_processed+1,history_skipped=history_skipped+1,history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
+            continue;
+          }
 
-        if(!msg){
-          await p.query('UPDATE forward_tasks SET history_processed=history_processed+1,history_skipped=history_skipped+1,history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
-          continue;
-        }
+          if(!filters[getGramJsMessageType(msg)]){
+            await p.query('UPDATE forward_tasks SET history_processed=history_processed+1,history_skipped=history_skipped+1,history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
+            continue;
+          }
 
-        if(!filters[getGramJsMessageType(msg)]){
-          await p.query('UPDATE forward_tasks SET history_processed=history_processed+1,history_skipped=history_skipped+1,history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
-          continue;
-        }
-
-        ids.push(id);
-      }
-
-      if(ids.length){
-        try{
-          const messages=[];
-          for(const id of ids){
+          let messages=[msg];
+          if(msg.groupedId!=null){
             try{
-              const got=await client.getMessages(source,{ids:[id]});
-              const msg=Array.isArray(got)?got[0]:got;
-              if(msg)messages.push(msg);
+              const around=await client.getMessages(source,{limit:20,around:Number(msg.id)});
+              const album=around.filter(x=>x && x.groupedId!=null && String(x.groupedId)===String(msg.groupedId));
+              if(album.length)messages=album.sort((a,b)=>Number(a.id)-Number(b.id));
             }catch(err){
-              console.error('历史消息读取失败',taskId,id,err?.message||err);
+              console.error('历史相册读取失败',taskId,id,err?.message||err);
             }
           }
 
-          const expanded=[];
-          const seen=new Set();
-          for(const msg of messages){
-            if(msg.groupedId!=null){
-              const albumKey=String(msg.groupedId);
-              if(seen.has('album:'+albumKey))continue;
-              seen.add('album:'+albumKey);
-              try{
-                const around=await client.getMessages(source,{limit:20,around:Number(msg.id)});
-                const album=around.filter(x=>x && x.groupedId!=null && String(x.groupedId)===albumKey);
-                for(const item of album)expanded.push(item);
-                if(!album.length)expanded.push(msg);
-              }catch{
-                expanded.push(msg);
-              }
-            }else{
-              expanded.push(msg);
-            }
-          }
-
-          const uniqueMessages=[...new Map(expanded.map(msg=>[Number(msg.id),msg])).values()]
-            .sort((a,b)=>Number(a.id)-Number(b.id));
-          const topicEnabled=parseFilters(task.filters_json).clone_topics!==false;
+          const topicEnabled=filters.clone_topics!==false;
           const out=await sendTelegramMessagesWithoutSource(
             client,
             target,
-            uniqueMessages,
-            topicEnabled ? async msg => ensureTargetForumTopic(client, task, source, target, getForumTopicId(msg)) : null
-          );
-          const arr=Array.isArray(out)?out:[out];
-
-          for(let i=0;i<ids.length;i++){
-            const id=ids[i];
-            const pos=uniqueMessages.findIndex(msg=>Number(msg.id)===id);
-            await markForwarded(taskId,id,Number(arr[pos]?.id||0));
-            await p.query('UPDATE forward_tasks SET history_processed=history_processed+1,history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
-          }
-        }catch(err){
-          console.error('历史无来源转发失败，逐条重试',taskId,err?.message||err);
-
-          for(const id of ids){
-            try{
-              const got=await client.getMessages(source,{ids:[id]});
-              const msg=Array.isArray(got)?got[0]:got;
-              if(!msg)throw new Error('消息不存在');
-              const topicEnabled=parseFilters(task.filters_json).clone_topics!==false;
-              const out=await sendTelegramMessagesWithoutSource(
-                client,
-                target,
-                [msg],
-                topicEnabled ? async item => ensureTargetForumTopic(client, task, source, target, getForumTopicId(item)) : null
-              );
-              const one=Array.isArray(out)?out[0]:out;
-              await markForwarded(taskId,id,Number(one?.id||0));
-              await p.query('UPDATE forward_tasks SET history_processed=history_processed+1,history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
-            }catch(singleErr){
-              console.error('历史单条无来源转发失败',taskId,id,singleErr?.message||singleErr);
-              await p.query('UPDATE forward_tasks SET history_processed=history_processed+1,history_failed=history_failed+1,history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
+            messages,
+            topicEnabled ? async item => ensureTargetForumTopic(client,task,source,target,getForumTopicId(item)) : null,
+            async (item,topicId) => {
+              if(filters.clone_comments===false)return 0;
+              const sourceReplyId=getDirectReplyMessageId(item,getForumTopicId(item));
+              if(!sourceReplyId)return 0;
+              return await getForwardedTargetMessageId(taskId,sourceReplyId);
             }
-          }
+          );
+
+          const arr=Array.isArray(out)?out:[out];
+          const sentMessageId=Number(arr.find(Boolean)?.id||0);
+          await markForwarded(taskId,id,sentMessageId);
+          await p.query(
+            'UPDATE forward_tasks SET history_processed=history_processed+1,history_next_id=? WHERE id=? AND admin_id=?',
+            [id+1,taskId,userId]
+          );
+          console.log('历史同步完成',taskId,'源消息',id,'目标消息',sentMessageId);
+        }catch(singleErr){
+          console.error('历史单条同步失败，继续下一条',taskId,id,singleErr?.message||singleErr);
+          await p.query(
+            'UPDATE forward_tasks SET history_processed=history_processed+1,history_failed=history_failed+1,history_next_id=? WHERE id=? AND admin_id=?',
+            [id+1,taskId,userId]
+          );
         }
       }
 
@@ -819,6 +775,7 @@ async function syncTask(task) {
     }
 
     await p.query('UPDATE forward_tasks SET history_done=1,status="paused",history_next_id=history_end_id+1 WHERE id=? AND admin_id=?',[taskId,userId]);
+    console.log('历史同步全部完成',taskId);
   }catch(err){
     console.error('历史任务异常',taskId,err?.message||err);
     try{
