@@ -348,7 +348,7 @@ async function ensureTargetForumTopic(client, task, sourceEntity, targetEntity, 
   }
 }
 
-async function sendTelegramMessagesWithoutSource(client, target, messages, topicResolver = null) {
+async function sendTelegramMessagesWithoutSource(client, target, messages, topicResolver = null, replyResolver = null) {
   const list = [...messages].filter(Boolean);
   if (!list.length) return [];
 
@@ -357,20 +357,22 @@ async function sendTelegramMessagesWithoutSource(client, target, messages, topic
 
   for (const msg of list) {
     const topicId = topicResolver ? await topicResolver(msg) : 0;
+    const replyId = replyResolver ? await replyResolver(msg, topicId) : 0;
+    const replyTo = replyId > 0 ? replyId : topicId;
     if (msg.groupedId != null) {
-      const key = `${String(msg.groupedId)}:${topicId}`;
+      const key = `${String(msg.groupedId)}:${topicId}:${replyTo}`;
       if (!albums.has(key)) albums.set(key, []);
-      albums.get(key).push({ msg, topicId });
+      albums.get(key).push({ msg, topicId, replyTo });
     } else if (msg.media) {
       sent.push(await client.sendFile(target, {
         file: msg.media,
         caption: String(msg.message || ''),
-        ...(topicId > 0 ? { replyTo: topicId } : {})
+        ...(replyTo > 0 ? { replyTo } : {})
       }));
     } else if (msg.message) {
       sent.push(await client.sendMessage(target, {
         message: String(msg.message),
-        ...(topicId > 0 ? { replyTo: topicId } : {})
+        ...(replyTo > 0 ? { replyTo } : {})
       }));
     }
   }
@@ -378,12 +380,13 @@ async function sendTelegramMessagesWithoutSource(client, target, messages, topic
   for (const group of albums.values()) {
     group.sort((a, b) => Number(a.msg.id) - Number(b.msg.id));
     const topicId = Number(group[0]?.topicId || 0);
+    const replyTo = Number(group[0]?.replyTo || 0);
     const media = group.map(item => item.msg).filter(msg => msg.media);
     if (media.length > 1) {
       const result = await client.sendFile(target, {
         file: media.map(msg => msg.media),
         caption: media.map(msg => String(msg.message || '')),
-        ...(topicId > 0 ? { replyTo: topicId } : {})
+        ...(replyTo > 0 ? { replyTo } : {})
       });
       const arr = Array.isArray(result) ? result : [result];
       sent.push(...arr);
@@ -401,6 +404,29 @@ async function sendTelegramMessagesWithoutSource(client, target, messages, topic
     }
   }
   return sent;
+}
+
+async function getForwardedTargetMessageId(taskId, sourceMessageId) {
+  const p = await db();
+  for (let i = 0; i < 4; i++) {
+    const [rows] = await p.query(
+      'SELECT target_message_id FROM forwarded_messages WHERE task_id=? AND source_message_id=? LIMIT 1',
+      [Number(taskId), Number(sourceMessageId)]
+    );
+    const targetId = Number(rows[0]?.target_message_id || 0);
+    if (targetId > 0) return targetId;
+    if (i < 3) await new Promise(resolve => setTimeout(resolve, 300));
+  }
+  return 0;
+}
+
+function getDirectReplyMessageId(message, topicId) {
+  const reply = message?.replyTo;
+  const replyId = Number(reply?.replyToMsgId || 0);
+  if (replyId <= 0) return 0;
+  if (Number(replyId) === Number(topicId || 0)) return 0;
+  if (reply?.forumTopic && Number(reply?.replyToTopId || 0) === replyId) return 0;
+  return replyId;
 }
 
 async function forwardTelegramMessages(task, sourceChatId, messageIds, ownerId) {
@@ -435,7 +461,13 @@ async function forwardTelegramMessages(task, sourceChatId, messageIds, ownerId) 
       client,
       target,
       messages,
-      topicEnabled ? async msg => ensureTargetForumTopic(client, task, source, target, getForumTopicId(msg)) : null
+      topicEnabled ? async msg => ensureTargetForumTopic(client, task, source, target, getForumTopicId(msg)) : null,
+      async (msg, topicId) => {
+        if (parseFilters(task.filters_json).clone_comments === false) return 0;
+        const sourceReplyId = getDirectReplyMessageId(msg, getForumTopicId(msg));
+        if (!sourceReplyId) return 0;
+        return await getForwardedTargetMessageId(task.id, sourceReplyId);
+      }
     );
     const forwarded = Array.isArray(result) ? result : [result];
 
@@ -1524,6 +1556,9 @@ async function handleRealtimeMessage(ctx, message, chatId) {
 
   for (const task of tasks) {
     if (Number(task.target_chat_id) === Number(chatId)) continue;
+
+    // 已登录 Telegram 账号的任务统一走 MTProto 实时克隆，保留话题与回复结构。
+    if (userClients.has(Number(task.admin_id))) continue;
 
     const filters = parseFilters(task.filters_json);
     if (!filters[type]) continue;
