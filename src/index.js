@@ -744,7 +744,7 @@ function getGramJsMessageType(message) {
 
 function messageHasLink(message) {
   const text=String(message?.message||'');
-  if(/(?:https?:\/\/|www\.|t\.me\/|telegram\.me\/)[^\s<>()]+/i.test(text)) return true;
+  if(/(?:https?:\/\/|www\.|t\.me\/|telegram\.me\/|(?:[a-z0-9-]+\.)+(?:com|net|org|io|me|cc|tv|cn|co|top|xyz|site|info|pro|vip)(?:\/[^\s<>()]*)?)/i.test(text)) return true;
   const entities=Array.isArray(message?.entities)?message.entities:[];
   return entities.some(e=>/MessageEntity(?:Url|TextUrl|Email)/i.test(String(e?.className||e?.constructor?.name||'')));
 }
@@ -752,8 +752,8 @@ function applyContentFiltersToText(text, filters) {
   let value=String(text||'');
   const blockKeywords=Array.isArray(filters?.block_keywords)?filters.block_keywords:[];
   if(blockKeywords.some(k=>String(k||'') && value.toLowerCase().includes(String(k).toLowerCase()))) return null;
-  if(filters?.block_links===true && /(?:https?:\/\/|www\.|t\.me\/|telegram\.me\/)[^\s<>()]+/i.test(value)) return null;
-  if(filters?.remove_links===true) value=value.replace(/(?:https?:\/\/|www\.|t\.me\/|telegram\.me\/)[^\s<>()]+/gi,'').replace(/[ \t]{2,}/g,' ').trim();
+  if(filters?.block_links===true && /(?:https?:\/\/|www\.|t\.me\/|telegram\.me\/|(?:[a-z0-9-]+\.)+(?:com|net|org|io|me|cc|tv|cn|co|top|xyz|site|info|pro|vip)(?:\/[^\s<>()]*)?)/i.test(value)) return null;
+  if(filters?.remove_links===true) value=value.replace(/(?:https?:\/\/|www\.|t\.me\/|telegram\.me\/|(?:[a-z0-9-]+\.)+(?:com|net|org|io|me|cc|tv|cn|co|top|xyz|site|info|pro|vip)(?:\/[^\s<>()]*)?)/gi,'').replace(/[ \t]{2,}/g,' ').trim();
   const removeKeywords=Array.isArray(filters?.remove_keywords)?filters.remove_keywords:[];
   for(const k of removeKeywords){ const s=String(k||''); if(s) value=value.split(s).join(''); }
   const rules=Array.isArray(filters?.replace_rules)?filters.replace_rules:[];
@@ -763,6 +763,7 @@ function applyContentFiltersToText(text, filters) {
 function applyContentFiltersToMessage(message, filters) {
   if(!message)return null;
   const text=String(message.message||'');
+  if(filters?.block_links===true && messageHasLink(message)) return null;
   if(!text){
     if(filters?.block_links===true && messageHasLink(message)) return null;
     return message;
