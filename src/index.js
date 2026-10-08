@@ -34,6 +34,7 @@ const forwardingLocks = new Set();
 const albumQueues = new Map();
 const userClients = new Map();
 const clientStarting = new Map();
+const botUserNotifications = new Set();
 
 const DEFAULT_FILTERS = {
   text: true,
@@ -393,7 +394,8 @@ bot.use(async (ctx, next) => {
   const status = await ensureBotUser(uid);
   if (status === 'authorized') return next();
 
-  if (status === 'pending' && uid !== adminId) {
+  if (status === 'pending' && uid !== adminId && !botUserNotifications.has(uid)) {
+    botUserNotifications.add(uid);
     try {
       await bot.telegram.sendMessage(
         adminId,
