@@ -724,10 +724,13 @@ bot.action('sync_settings', async ctx => {
   if (!rows.length) return ctx.answerCbQuery('没有任务');
   await ctx.answerCbQuery();
   return ctx.reply(
-    '⚙️ 同步设置\\n\\n请选择要设置的任务：',
-    Markup.inlineKeyboard(rows.map(t => [
-      Markup.button.callback(`#${t.id} ${t.source_chat_id} → ${t.target_chat_id}`, `syncset_task_${t.id}`)
-    ]))
+    '⚙️ 同步设置\n\n请选择要设置的任务：',
+    Markup.inlineKeyboard([
+      ...rows.map(t => [
+        Markup.button.callback(`#${t.id} ${t.source_chat_id} → ${t.target_chat_id}`, `syncset_task_${t.id}`)
+      ]),
+      [Markup.button.callback('🏠 返回主页','menu_back')]
+    ])
   );
 });
 
@@ -742,7 +745,7 @@ bot.action(/^syncset_task_(\\d+)$/, async ctx => {
   const realtime = Number(rows[0].realtime) === 1;
   await ctx.answerCbQuery();
   return ctx.reply(
-    `⚙️ 任务 #${taskId} 同步设置\\n\\n🧵 话题群：${topicClone ? '✅ 完整克隆' : '❌ 不克隆'}\\n💬 评论区：${commentClone ? '✅ 克隆' : '❌ 不克隆'}\\n🔄 实时同步：${realtime ? '✅ 开启' : '❌ 关闭'}`,
+    `⚙️ 任务 #${taskId} 同步设置\n\n🧵 话题群：${topicClone ? '✅ 完整克隆' : '❌ 不克隆'}\n💬 评论区：${commentClone ? '✅ 克隆' : '❌ 不克隆'}\n🔄 实时同步：${realtime ? '✅ 开启' : '❌ 关闭'}`,
     Markup.inlineKeyboard([
       [Markup.button.callback(`🧵 完整克隆话题群 ${topicClone ? '✅' : '❌'}`,`syncset_${taskId}_topics`)],
       [Markup.button.callback(`💬 克隆评论区 ${commentClone ? '✅' : '❌'}`,`syncset_${taskId}_comments`)],
