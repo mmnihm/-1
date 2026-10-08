@@ -1720,13 +1720,13 @@ async function handleRealtimeMessage(ctx, message, chatId) {
   }
 }
 
-bot.on('message', async ctx => {
+bot.on('message', async (ctx, next) => {
   try {
-    if (ctx.chat?.type !== 'private') return;
-    if (await processHistoryInput(ctx)) return;
+    if (ctx.chat?.type === 'private' && await processHistoryInput(ctx)) return;
   } catch (err) {
     console.error('私聊历史范围处理失败', err?.message || err);
   }
+  return next();
 });
 
 bot.on('channel_post', async ctx => {
