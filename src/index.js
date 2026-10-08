@@ -599,11 +599,8 @@ async function forwardDiscussionRealtime(task, sourceChatId, messageId, ownerId)
   const client = userClients.get(Number(ownerId));
   if (!client) return;
   await ensureDiscussionMessageTable();
-  const p = await db();
-  const [maps] = await p.query('SELECT * FROM telegram_discussion_maps WHERE task_id=? AND source_discussion_chat_id=? ORDER BY id DESC LIMIT 50',
-    [Number(task.id),Number(sourceChatId)]);
-  if (!maps.length) return;
 
+  const p = await db();
   const sourceChat = await client.getEntity(Number(sourceChatId));
   const got = await client.getMessages(sourceChat,{ids:[Number(messageId)]});
   const message = Array.isArray(got) ? got[0] : got;
@@ -612,31 +609,49 @@ async function forwardDiscussionRealtime(task, sourceChatId, messageId, ownerId)
   const filters = parseFilters(task.filters_json);
   if (filters.clone_comments === false || !filters[getGramJsMessageType(message)]) return;
 
-  const [exists] = await p.query('SELECT target_message_id FROM telegram_discussion_message_maps WHERE task_id=? AND source_chat_id=? AND source_message_id=? LIMIT 1',
-    [Number(task.id),Number(sourceChatId),Number(messageId)]);
+  const reply = message?.replyTo;
+  const rootId = Number(reply?.replyToTopId || reply?.replyToMsgId || 0);
+  if (!rootId) {
+    console.log('评论区消息没有找到所属帖子根消息，跳过', task.id, sourceChatId, messageId);
+    return;
+  }
+
+  // 一个讨论群会承载多个频道帖子的评论，必须按“评论所属根消息”精确匹配。
+  const [maps] = await p.query(
+    'SELECT * FROM telegram_discussion_maps WHERE task_id=? AND source_discussion_chat_id=? AND source_discussion_root_id=? LIMIT 1',
+    [Number(task.id),Number(sourceChatId),rootId]
+  );
+  if(!maps.length) return;
+  const map = maps[0];
+
+  const [exists] = await p.query(
+    'SELECT target_message_id FROM telegram_discussion_message_maps WHERE task_id=? AND source_chat_id=? AND source_message_id=? LIMIT 1',
+    [Number(task.id),Number(sourceChatId),Number(messageId)]
+  );
   if (exists.length) return;
 
-  for (const map of maps) {
-    let replyTo = Number(map.target_discussion_root_id);
-    const sourceReplyId = getDirectReplyMessageId(message, Number(map.source_discussion_root_id));
-    if (sourceReplyId > 0) {
-      const [parent] = await p.query('SELECT target_message_id FROM telegram_discussion_message_maps WHERE task_id=? AND source_chat_id=? AND source_message_id=? LIMIT 1',
-        [Number(task.id),Number(sourceChatId),Number(sourceReplyId)]);
-      if (parent.length) replyTo = Number(parent[0].target_message_id);
-    }
-    try {
-      const targetChat = await client.getEntity(Number(map.target_discussion_chat_id));
-      const sent = await sendDiscussionMessage(client,targetChat,message,replyTo);
-      if (!sent?.id) continue;
-      await p.query('INSERT IGNORE INTO telegram_discussion_message_maps (task_id,source_chat_id,source_message_id,target_chat_id,target_message_id) VALUES (?,?,?,?,?)',
-        [Number(task.id),Number(sourceChatId),Number(messageId),Number(map.target_discussion_chat_id),Number(sent.id)]);
-    } catch (err) {
-      console.error('实时评论同步失败',task.id,messageId,err?.message||err);
-    }
-    break;
+  let replyTo = Number(map.target_discussion_root_id);
+  const sourceReplyId = getDirectReplyMessageId(message, Number(map.source_discussion_root_id));
+  if (sourceReplyId > 0) {
+    const [parent] = await p.query(
+      'SELECT target_message_id FROM telegram_discussion_message_maps WHERE task_id=? AND source_chat_id=? AND source_message_id=? LIMIT 1',
+      [Number(task.id),Number(sourceChatId),Number(sourceReplyId)]
+    );
+    if (parent.length) replyTo = Number(parent[0].target_message_id);
+  }
+
+  try {
+    const targetChat = await client.getEntity(Number(map.target_discussion_chat_id));
+    const sent = await sendDiscussionMessage(client,targetChat,message,replyTo);
+    if (!sent?.id) return;
+    await p.query(
+      'INSERT IGNORE INTO telegram_discussion_message_maps (task_id,source_chat_id,source_message_id,target_chat_id,target_message_id) VALUES (?,?,?,?,?)',
+      [Number(task.id),Number(sourceChatId),Number(messageId),Number(map.target_discussion_chat_id),Number(sent.id)]
+    );
+  } catch (err) {
+    console.error('实时评论同步失败',task.id,messageId,err?.message||err);
   }
 }
-
 async function forwardTelegramMessages(task, sourceChatId, messageIds, ownerId) {
   const client=userClients.get(Number(ownerId));
   if(!client)return;
