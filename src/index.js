@@ -35,6 +35,7 @@ const albumQueues = new Map();
 const userClients = new Map();
 const clientStarting = new Map();
 const botUserNotifications = new Set();
+const topicCloneLocks = new Map();
 
 const DEFAULT_FILTERS = {
   text: true,
@@ -132,6 +133,21 @@ async function db() {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS telegram_topic_maps (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        task_id BIGINT UNSIGNED NOT NULL,
+        source_topic_id BIGINT NOT NULL,
+        target_topic_id BIGINT NOT NULL,
+        title VARCHAR(128) NOT NULL,
+        icon_color INT DEFAULT NULL,
+        icon_emoji_id VARCHAR(64) DEFAULT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY uq_topic_map (task_id, source_topic_id),
+        KEY idx_topic_target (task_id, target_topic_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `);
 
     await pool.query(`
       INSERT IGNORE INTO bot_users (user_id, status)
@@ -227,7 +243,112 @@ async function forwardTelegramAlbum(key) {
   if (ids.length) await forwardTelegramMessages(queue.task, queue.sourceChatId, ids, queue.ownerId);
 }
 
-async function sendTelegramMessagesWithoutSource(client, target, messages) {
+function getForumTopicId(message) {
+  const reply = message?.replyTo;
+  const top = Number(reply?.replyToTopId || 0);
+  if (top > 0) return top;
+  const replyToMsgId = Number(reply?.replyToMsgId || 0);
+  if (reply?.forumTopic && replyToMsgId > 0) return replyToMsgId;
+  if (message?.action?.className === 'MessageActionTopicCreate' && Number(message?.id) > 0) {
+    return Number(message.id);
+  }
+  return 0;
+}
+
+async function getForumTopicInfo(client, sourceEntity, topicId) {
+  const id = Number(topicId || 0);
+  if (!id) return null;
+  if (id === 1) return { id: 1, title: 'General', iconColor: 0x6FB9F0, iconEmojiId: null };
+  try {
+    const result = await client.invoke(new Api.channels.GetForumTopicsByID({
+      channel: sourceEntity,
+      topics: [id]
+    }));
+    const topic = result?.topics?.find(item => Number(item?.id) === id) || result?.topics?.[0];
+    if (!topic) return null;
+    return {
+      id,
+      title: String(topic.title || ('Topic ' + id)).slice(0, 128),
+      iconColor: Number(topic.iconColor || 0x6FB9F0),
+      iconEmojiId: topic.iconEmojiId != null ? String(topic.iconEmojiId) : null
+    };
+  } catch (err) {
+    console.error('读取话题信息失败', id, err?.message || err);
+    return null;
+  }
+}
+
+async function ensureTargetForumTopic(client, task, sourceEntity, targetEntity, sourceTopicId) {
+  const sourceId = Number(sourceTopicId || 0);
+  if (!sourceId) return 0;
+  if (targetEntity?.forum !== true) return 0;
+
+  const key = \`topic:\${Number(task.id)}:\${sourceId}\`;
+  if (topicCloneLocks.has(key)) return topicCloneLocks.get(key);
+
+  const promise = (async () => {
+    const p = await db();
+    const [existing] = await p.query(
+      'SELECT target_topic_id FROM telegram_topic_maps WHERE task_id=? AND source_topic_id=? LIMIT 1',
+      [Number(task.id), sourceId]
+    );
+    if (existing.length) return Number(existing[0].target_topic_id);
+
+    if (sourceId === 1) {
+      await p.query(
+        'INSERT IGNORE INTO telegram_topic_maps (task_id,source_topic_id,target_topic_id,title,icon_color,icon_emoji_id) VALUES (?,?,?,?,?,?)',
+        [Number(task.id),1,1,'General',0x6FB9F0,null]
+      );
+      return 1;
+    }
+
+    const info = await getForumTopicInfo(client, sourceEntity, sourceId);
+    if (!info) return 0;
+
+    const validColors = new Set([0x6FB9F0,0xFFD67E,0xCB86DB,0x8EEE98,0xFF93B2,0xFB6F5F]);
+    const args = {
+      channel: targetEntity,
+      title: info.title || ('Topic ' + sourceId),
+      randomId: BigInt(Date.now()),
+      iconColor: validColors.has(info.iconColor) ? info.iconColor : 0x6FB9F0
+    };
+    if (info.iconEmojiId) args.iconEmojiId = info.iconEmojiId;
+
+    let result;
+    try {
+      result = await client.invoke(new Api.channels.CreateForumTopic(args));
+    } catch (err) {
+      if (!info.iconEmojiId) throw err;
+      delete args.iconEmojiId;
+      result = await client.invoke(new Api.channels.CreateForumTopic(args));
+    }
+
+    const created = result?.updates?.find(update =>
+      update?.action?.className === 'MessageActionTopicCreate'
+    );
+    const targetId = Number(created?.id || created?.message || 0);
+    if (!targetId) throw new Error('创建目标话题后未获取到话题 ID');
+
+    await p.query(
+      'INSERT IGNORE INTO telegram_topic_maps (task_id,source_topic_id,target_topic_id,title,icon_color,icon_emoji_id) VALUES (?,?,?,?,?,?)',
+      [Number(task.id),sourceId,targetId,info.title,info.iconColor,info.iconEmojiId]
+    );
+    const [saved] = await p.query(
+      'SELECT target_topic_id FROM telegram_topic_maps WHERE task_id=? AND source_topic_id=? LIMIT 1',
+      [Number(task.id),sourceId]
+    );
+    return saved.length ? Number(saved[0].target_topic_id) : targetId;
+  })();
+
+  topicCloneLocks.set(key, promise);
+  try {
+    return await promise;
+  } finally {
+    topicCloneLocks.delete(key);
+  }
+}
+
+async function sendTelegramMessagesWithoutSource(client, target, messages, topicResolver = null) {
   const list = [...messages].filter(Boolean);
   if (!list.length) return [];
 
@@ -235,42 +356,50 @@ async function sendTelegramMessagesWithoutSource(client, target, messages) {
   const albums = new Map();
 
   for (const msg of list) {
+    const topicId = topicResolver ? await topicResolver(msg) : 0;
     if (msg.groupedId != null) {
-      const key = String(msg.groupedId);
+      const key = \`\${String(msg.groupedId)}:\${topicId}\`;
       if (!albums.has(key)) albums.set(key, []);
-      albums.get(key).push(msg);
-    } else {
-      if (msg.media) {
-        sent.push(await client.sendFile(target, {
-          file: msg.media,
-          caption: String(msg.message || '')
-        }));
-      } else if (msg.message) {
-        sent.push(await client.sendMessage(target, { message: String(msg.message) }));
-      }
+      albums.get(key).push({ msg, topicId });
+    } else if (msg.media) {
+      sent.push(await client.sendFile(target, {
+        file: msg.media,
+        caption: String(msg.message || ''),
+        ...(topicId > 0 ? { replyTo: topicId } : {})
+      }));
+    } else if (msg.message) {
+      sent.push(await client.sendMessage(target, {
+        message: String(msg.message),
+        ...(topicId > 0 ? { replyTo: topicId } : {})
+      }));
     }
   }
 
   for (const group of albums.values()) {
-    group.sort((a, b) => Number(a.id) - Number(b.id));
-    const media = group.filter(msg => msg.media);
+    group.sort((a, b) => Number(a.msg.id) - Number(b.msg.id));
+    const topicId = Number(group[0]?.topicId || 0);
+    const media = group.map(item => item.msg).filter(msg => msg.media);
     if (media.length > 1) {
       const result = await client.sendFile(target, {
         file: media.map(msg => msg.media),
-        caption: media.map(msg => String(msg.message || ''))
+        caption: media.map(msg => String(msg.message || '')),
+        ...(topicId > 0 ? { replyTo: topicId } : {})
       });
       const arr = Array.isArray(result) ? result : [result];
       sent.push(...arr);
     } else if (media.length === 1) {
       sent.push(await client.sendFile(target, {
         file: media[0].media,
-        caption: String(media[0].message || '')
+        caption: String(media[0].message || ''),
+        ...(topicId > 0 ? { replyTo: topicId } : {})
       }));
-    } else if (group[0]?.message) {
-      sent.push(await client.sendMessage(target, { message: String(group[0].message) }));
+    } else if (group[0]?.msg?.message) {
+      sent.push(await client.sendMessage(target, {
+        message: String(group[0].msg.message),
+        ...(topicId > 0 ? { replyTo: topicId } : {})
+      }));
     }
   }
-
   return sent;
 }
 
@@ -301,7 +430,13 @@ async function forwardTelegramMessages(task, sourceChatId, messageIds, ownerId) 
       if (msg) messages.push(msg);
     }
 
-    const result = await sendTelegramMessagesWithoutSource(client, target, messages);
+    const topicEnabled = parseFilters(task.filters_json).clone_topics !== false;
+    const result = await sendTelegramMessagesWithoutSource(
+      client,
+      target,
+      messages,
+      topicEnabled ? async msg => ensureTargetForumTopic(client, task, source, target, getForumTopicId(msg)) : null
+    );
     const forwarded = Array.isArray(result) ? result : [result];
 
     for (let i = 0; i < pending.length; i++) {
@@ -607,7 +742,13 @@ async function syncTask(task) {
 
           const uniqueMessages=[...new Map(expanded.map(msg=>[Number(msg.id),msg])).values()]
             .sort((a,b)=>Number(a.id)-Number(b.id));
-          const out=await sendTelegramMessagesWithoutSource(client,target,uniqueMessages);
+          const topicEnabled=parseFilters(task.filters_json).clone_topics!==false;
+          const out=await sendTelegramMessagesWithoutSource(
+            client,
+            target,
+            uniqueMessages,
+            topicEnabled ? async msg => ensureTargetForumTopic(client, task, source, target, getForumTopicId(msg)) : null
+          );
           const arr=Array.isArray(out)?out:[out];
 
           for(let i=0;i<ids.length;i++){
@@ -624,7 +765,13 @@ async function syncTask(task) {
               const got=await client.getMessages(source,{ids:[id]});
               const msg=Array.isArray(got)?got[0]:got;
               if(!msg)throw new Error('消息不存在');
-              const out=await sendTelegramMessagesWithoutSource(client,target,[msg]);
+              const topicEnabled=parseFilters(task.filters_json).clone_topics!==false;
+              const out=await sendTelegramMessagesWithoutSource(
+                client,
+                target,
+                [msg],
+                topicEnabled ? async item => ensureTargetForumTopic(client, task, source, target, getForumTopicId(item)) : null
+              );
               const one=Array.isArray(out)?out[0]:out;
               await markForwarded(taskId,id,Number(one?.id||0));
               await p.query('UPDATE forward_tasks SET history_processed=history_processed+1,history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
@@ -1123,6 +1270,7 @@ bot.action(/^history_task_(\d+)$/, async ctx => {
 
 bot.on('text', async (ctx, next) => {
   const uid=Number(ctx.from.id);
+  const session = sessions.get(uid);
 
   if (session?.step === 'admin_authorize_user') {
     if (uid !== adminId) {
@@ -1144,7 +1292,6 @@ bot.on('text', async (ctx, next) => {
     return ctx.reply(`✅ 用户 ${targetId} 已授权。\n\n你可以继续在“👑 用户管理”里管理其他用户。`, menu(uid));
   }
 
-  const session = sessions.get(uid);
   if (!session) return next();
 
   if(session.step==='tg_phone'){
