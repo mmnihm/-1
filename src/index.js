@@ -48,7 +48,10 @@ const DEFAULT_FILTERS = {
   sticker: true,
   video_note: true,
   other: true,
-  block_forwarded: false,
+  block_links: false,
+  remove_links: false,
+  block_keywords: [],
+  remove_keywords: [],
   replace_rules: []
 };
 
@@ -384,7 +387,7 @@ async function ensureTargetForumTopic(client, task, sourceEntity, targetEntity, 
 }
 
 async function sendTelegramMessagesWithoutSource(client, target, messages, topicResolver = null, replyResolver = null, filters = null) {
-  const list = [...messages].filter(Boolean).map(msg => applyReplaceRulesToMessage(msg, filters));
+  const list = [...messages].filter(Boolean).map(msg => applyContentFiltersToMessage(msg, filters)).filter(Boolean);
   if (!list.length) return [];
 
   const sent = [];
@@ -644,7 +647,7 @@ async function forwardDiscussionRealtime(task, sourceChatId, messageId, ownerId)
 
   try {
     const targetChat = await client.getEntity(Number(map.target_discussion_chat_id));
-    const sent = await sendDiscussionMessage(client,targetChat,applyReplaceRulesToMessage(message,parseFilters(task.filters_json)),replyTo);
+    const sent = await sendDiscussionMessage(client,targetChat,applyContentFiltersToMessage(message,parseFilters(task.filters_json)),replyTo);
     if (!sent?.id) return;
     await p.query(
       'INSERT IGNORE INTO telegram_discussion_message_maps (task_id,source_chat_id,source_message_id,target_chat_id,target_message_id) VALUES (?,?,?,?,?)',
@@ -739,26 +742,44 @@ function getGramJsMessageType(message) {
   return 'other';
 }
 
-function isForwardedGramMessage(message) {
-  return !!(message?.fwdFrom || message?.forwardHeader || message?.forwardFrom);
+function messageHasLink(message) {
+  const text=String(message?.message||'');
+  if(/(?:https?:\/\/|www\.|t\.me\/|telegram\.me\/)[^\s<>()]+/i.test(text)) return true;
+  const entities=Array.isArray(message?.entities)?message.entities:[];
+  return entities.some(e=>/MessageEntity(?:Url|TextUrl|Email)/i.test(String(e?.className||e?.constructor?.name||'')));
 }
-function applyReplaceRulesToMessage(message, filters) {
+function applyContentFiltersToText(text, filters) {
+  let value=String(text||'');
+  const blockKeywords=Array.isArray(filters?.block_keywords)?filters.block_keywords:[];
+  if(blockKeywords.some(k=>String(k||'') && value.toLowerCase().includes(String(k).toLowerCase()))) return null;
+  if(filters?.block_links===true && /(?:https?:\/\/|www\.|t\.me\/|telegram\.me\/)[^\s<>()]+/i.test(value)) return null;
+  if(filters?.remove_links===true) value=value.replace(/(?:https?:\/\/|www\.|t\.me\/|telegram\.me\/)[^\s<>()]+/gi,'').replace(/[ \t]{2,}/g,' ').trim();
+  const removeKeywords=Array.isArray(filters?.remove_keywords)?filters.remove_keywords:[];
+  for(const k of removeKeywords){ const s=String(k||''); if(s) value=value.split(s).join(''); }
   const rules=Array.isArray(filters?.replace_rules)?filters.replace_rules:[];
-  if(!rules.length||!message)return message;
+  for(const rule of rules){ const from=String(rule?.from??''); const to=String(rule?.to??''); if(from) value=value.split(from).join(to); }
+  return value;
+}
+function applyContentFiltersToMessage(message, filters) {
+  if(!message)return null;
+  const text=String(message.message||'');
+  if(!text){
+    if(filters?.block_links===true && messageHasLink(message)) return null;
+    return message;
+  }
+  const value=applyContentFiltersToText(text,filters);
+  if(value===null)return null;
+  if(value===text)return message;
   const clone=Object.create(Object.getPrototypeOf(message));
   Object.assign(clone,message);
-  let text=String(message.message||'');
-  for(const rule of rules){
-    const from=String(rule?.from??''); const to=String(rule?.to??'');
-    if(from) text=text.split(from).join(to);
-  }
-  clone.message=text;
+  clone.message=value;
+  if('entities' in clone) clone.entities=[];
   return clone;
 }
 function shouldForwardMessage(message,filters){
   if(!message)return false;
-  if(filters?.block_forwarded===true && isForwardedGramMessage(message))return false;
-  return !!filters[getGramJsMessageType(message)];
+  if(!filters[getGramJsMessageType(message)])return false;
+  return applyContentFiltersToMessage(message,filters)!==null;
 }
 
 function isAdmin(ctx) {
@@ -905,8 +926,10 @@ function filterText(filters) {
     other: '其他'
   };
   const media=Object.keys(labels).map(k => `${filters[k] ? '✅' : '❌'}${labels[k]}`).join('  ');
-  const count=Array.isArray(filters.replace_rules)?filters.replace_rules.length:0;
-  return media+`\n🚫屏蔽转发消息：${filters.block_forwarded?'✅':'❌'}\n🔄关键词/链接替换：${count?'✅ '+count+'条':'❌ 未设置'}`;
+  const replaceCount=Array.isArray(filters.replace_rules)?filters.replace_rules.length:0;
+  const blockCount=Array.isArray(filters.block_keywords)?filters.block_keywords.length:0;
+  const removeCount=Array.isArray(filters.remove_keywords)?filters.remove_keywords.length:0;
+  return media+`\n🔗屏蔽链接：${filters.block_links?'✅':'❌'}  🧹去除链接：${filters.remove_links?'✅':'❌'}\n🚫屏蔽关键词：${blockCount?'✅ '+blockCount+'条':'❌'}  🧹去除关键词：${removeCount?'✅ '+removeCount+'条':'❌'}\n🔄关键词替换：${replaceCount?'✅ '+replaceCount+'条':'❌'}`;
 }
 
 async function getTasks(userId) {
@@ -1426,14 +1449,16 @@ bot.action(/^filter_task_(\d+)$/, async ctx => {
       [Markup.button.callback(`音频 ${filters.audio ? '✅' : '❌'}`, `ft_${taskId}_audio`), Markup.button.callback(`语音 ${filters.voice ? '✅' : '❌'}`, `ft_${taskId}_voice`)],
       [Markup.button.callback(`动图 ${filters.animation ? '✅' : '❌'}`, `ft_${taskId}_animation`), Markup.button.callback(`贴纸 ${filters.sticker ? '✅' : '❌'}`, `ft_${taskId}_sticker`)],
       [Markup.button.callback(`视频消息 ${filters.video_note ? '✅' : '❌'}`, `ft_${taskId}_video_note`), Markup.button.callback(`其他 ${filters.other ? '✅' : '❌'}`, `ft_${taskId}_other`)],
-      [Markup.button.callback(`🚫 屏蔽转发消息 ${filters.block_forwarded ? '✅' : '❌'}`, `ft_${taskId}_block_forwarded`)],
-      [Markup.button.callback('🔄 关键词/链接替换', `replace_rules_${taskId}`)],
+      [Markup.button.callback(`🔗 屏蔽链接 ${filters.block_links ? '✅' : '❌'}`, `ft_${taskId}_block_links`), Markup.button.callback(`🧹 去除链接 ${filters.remove_links ? '✅' : '❌'}`, `ft_${taskId}_remove_links`)],
+      [Markup.button.callback(`🚫 屏蔽关键词 ${Array.isArray(filters.block_keywords)&&filters.block_keywords.length ? '✅' : '❌'}`, `keyword_rules_${taskId}_block`)],
+      [Markup.button.callback(`🧹 去除关键词 ${Array.isArray(filters.remove_keywords)&&filters.remove_keywords.length ? '✅' : '❌'}`, `keyword_rules_${taskId}_remove`)],
+      [Markup.button.callback('🔄 关键词替换', `replace_rules_${taskId}`)],
       [Markup.button.callback('⬅️ 返回', 'filters')]
     ])
   );
 });
 
-bot.action(/^ft_(\d+)_(text|photo|video|document|audio|voice|animation|sticker|video_note|other|block_forwarded)$/, async ctx => {
+bot.action(/^ft_(\d+)_(text|photo|video|document|audio|voice|animation|sticker|video_note|other|block_links|remove_links)$/, async ctx => {
   const taskId = Number(ctx.match[1]);
   const type = ctx.match[2];
   const p = await db();
@@ -1445,6 +1470,29 @@ bot.action(/^ft_(\d+)_(text|photo|video|document|audio|voice|animation|sticker|v
   await p.query('UPDATE forward_tasks SET filters_json=? WHERE id=?', [JSON.stringify(filters), taskId]);
   await ctx.answerCbQuery(filters[type] ? '已允许' : '已过滤');
   return ctx.reply(`🎛 任务 #${taskId}\n\n${filterText(filters)}`, menu(ctx.from.id));
+});
+
+bot.action(/^keyword_rules_(\d+)_(block|remove)$/, async ctx => {
+  const taskId=Number(ctx.match[1]), mode=ctx.match[2], uid=Number(ctx.from.id);
+  const p=await db(); const [rows]=await p.query('SELECT filters_json FROM forward_tasks WHERE id=? AND admin_id=?',[taskId,uid]);
+  if(!rows.length)return ctx.answerCbQuery('任务不存在');
+  const f=parseFilters(rows[0].filters_json);
+  const key=mode==='block'?'block_keywords':'remove_keywords';
+  const list=Array.isArray(f[key])?f[key]:[];
+  sessions.set(uid,{step:'keyword_rule',taskId,mode});
+  const title=mode==='block'?'🚫 屏蔽关键词':'🧹 去除关键词';
+  const shown=list.length?list.map((x,i)=>`${i+1}. ${x}`).join('\n'):'暂无关键词';
+  await ctx.answerCbQuery();
+  return ctx.reply(`${title}\n\n${shown}\n\n请发送一个关键词，每行一个也可以连续添加。发送“完成”结束。`,
+    Markup.inlineKeyboard([[Markup.button.callback('🗑 清空全部',`keyword_clear_${taskId}_${mode}`)],[Markup.button.callback('⬅️ 返回','filters')]]));
+});
+bot.action(/^keyword_clear_(\d+)_(block|remove)$/, async ctx => {
+  const taskId=Number(ctx.match[1]), mode=ctx.match[2], uid=Number(ctx.from.id);
+  const p=await db(); const [rows]=await p.query('SELECT filters_json FROM forward_tasks WHERE id=? AND admin_id=?',[taskId,uid]);
+  if(!rows.length)return ctx.answerCbQuery('任务不存在');
+  const f=parseFilters(rows[0].filters_json); f[mode==='block'?'block_keywords':'remove_keywords']=[];
+  await p.query('UPDATE forward_tasks SET filters_json=? WHERE id=? AND admin_id=?',[JSON.stringify(f),taskId,uid]);
+  sessions.delete(uid); await ctx.answerCbQuery('已清空'); return ctx.reply('✅ 关键词已清空。',menu(uid));
 });
 
 bot.action(/^replace_rules_(\d+)$/, async ctx => {
@@ -1593,7 +1641,21 @@ async function processHistoryInput(ctx) {
 bot.on('text', async (ctx, next) => {
   const uid=Number(ctx.from.id);
   const session = sessions.get(uid);
-    if (session?.step === 'replace_rule') {
+    if (session?.step === 'keyword_rule') {
+    const value=String(ctx.message?.text||'').trim();
+    if(value==='完成'){sessions.delete(uid);return ctx.reply('✅ 关键词设置已保存。',menu(uid));}
+    const values=value.split(/\r?\n|,/).map(x=>x.trim()).filter(Boolean);
+    if(!values.length)return ctx.reply('❌ 请输入关键词。');
+    const p=await db(); const [rows]=await p.query('SELECT filters_json FROM forward_tasks WHERE id=? AND admin_id=?',[session.taskId,uid]);
+    if(!rows.length){sessions.delete(uid);return ctx.reply('任务不存在',menu(uid));}
+    const f=parseFilters(rows[0].filters_json); const key=session.mode==='block'?'block_keywords':'remove_keywords';
+    f[key]=Array.isArray(f[key])?f[key]:[];
+    for(const v of values)if(!f[key].includes(v))f[key].push(v);
+    await p.query('UPDATE forward_tasks SET filters_json=? WHERE id=? AND admin_id=?',[JSON.stringify(f),session.taskId,uid]);
+    return ctx.reply(`✅ 已添加关键词：${values.join('、')}\n继续发送，或发送“完成”。`);
+  }
+
+  if (session?.step === 'replace_rule') {
       const value=String(ctx.message?.text||'').trim();
       if(value==='完成'){sessions.delete(uid);return ctx.reply('✅ 替换规则已保存。',menu(uid));}
       const m=value.match(/^(.+?)\s*(?:=>|->|＝>|→)\s*(.*)$/);
