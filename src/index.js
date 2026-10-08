@@ -283,7 +283,7 @@ async function ensureTargetForumTopic(client, task, sourceEntity, targetEntity, 
   if (!sourceId) return 0;
   if (targetEntity?.forum !== true) return 0;
 
-  const key = \`topic:\${Number(task.id)}:\${sourceId}\`;
+  const key = `topic:${Number(task.id)}:${sourceId}`;
   if (topicCloneLocks.has(key)) return topicCloneLocks.get(key);
 
   const promise = (async () => {
@@ -358,7 +358,7 @@ async function sendTelegramMessagesWithoutSource(client, target, messages, topic
   for (const msg of list) {
     const topicId = topicResolver ? await topicResolver(msg) : 0;
     if (msg.groupedId != null) {
-      const key = \`\${String(msg.groupedId)}:\${topicId}\`;
+      const key = `${String(msg.groupedId)}:${topicId}`;
       if (!albums.has(key)) albums.set(key, []);
       albums.get(key).push({ msg, topicId });
     } else if (msg.media) {
