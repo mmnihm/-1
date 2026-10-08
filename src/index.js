@@ -203,6 +203,53 @@ async function forwardTelegramAlbum(key) {
   if (ids.length) await forwardTelegramMessages(queue.task, queue.sourceChatId, ids, queue.ownerId);
 }
 
+async function sendTelegramMessagesWithoutSource(client, target, messages) {
+  const list = [...messages].filter(Boolean);
+  if (!list.length) return [];
+
+  const sent = [];
+  const albums = new Map();
+
+  for (const msg of list) {
+    if (msg.groupedId != null) {
+      const key = String(msg.groupedId);
+      if (!albums.has(key)) albums.set(key, []);
+      albums.get(key).push(msg);
+    } else {
+      if (msg.media) {
+        sent.push(await client.sendFile(target, {
+          file: msg.media,
+          caption: String(msg.message || '')
+        }));
+      } else if (msg.message) {
+        sent.push(await client.sendMessage(target, { message: String(msg.message) }));
+      }
+    }
+  }
+
+  for (const group of albums.values()) {
+    group.sort((a, b) => Number(a.id) - Number(b.id));
+    const media = group.filter(msg => msg.media);
+    if (media.length > 1) {
+      const result = await client.sendFile(target, {
+        file: media.map(msg => msg.media),
+        caption: media.map(msg => String(msg.message || ''))
+      });
+      const arr = Array.isArray(result) ? result : [result];
+      sent.push(...arr);
+    } else if (media.length === 1) {
+      sent.push(await client.sendFile(target, {
+        file: media[0].media,
+        caption: String(media[0].message || '')
+      }));
+    } else if (group[0]?.message) {
+      sent.push(await client.sendMessage(target, { message: String(group[0].message) }));
+    }
+  }
+
+  return sent;
+}
+
 async function forwardTelegramMessages(task, sourceChatId, messageIds, ownerId) {
   const client=userClients.get(Number(ownerId));
   if(!client)return;
@@ -223,18 +270,18 @@ async function forwardTelegramMessages(task, sourceChatId, messageIds, ownerId) 
   try {
     const target = await client.getEntity(Number(task.target_chat_id));
     const source = await client.getEntity(Number(sourceChatId));
-    const result = await client.forwardMessages(target, {
-      messages: pending.map(x => x.id),
-      fromPeer: source
-    });
+    const messages = [];
+    for (const item of pending) {
+      const got = await client.getMessages(source, { ids: [item.id] });
+      const msg = Array.isArray(got) ? got[0] : got;
+      if (msg) messages.push(msg);
+    }
+
+    const result = await sendTelegramMessagesWithoutSource(client, target, messages);
     const forwarded = Array.isArray(result) ? result : [result];
 
     for (let i = 0; i < pending.length; i++) {
-      await markForwarded(
-        task.id,
-        pending[i].id,
-        Number(forwarded[i]?.id || 0)
-      );
+      await markForwarded(task.id, pending[i].id, Number(forwarded[i]?.id || 0));
     }
 
     await p.query(
@@ -433,24 +480,62 @@ async function syncTask(task) {
 
       if(ids.length){
         try{
-          const out=await client.forwardMessages(target,{messages:ids,fromPeer:source});
+          const messages=[];
+          for(const id of ids){
+            try{
+              const got=await client.getMessages(source,{ids:[id]});
+              const msg=Array.isArray(got)?got[0]:got;
+              if(msg)messages.push(msg);
+            }catch(err){
+              console.error('历史消息读取失败',taskId,id,err?.message||err);
+            }
+          }
+
+          const expanded=[];
+          const seen=new Set();
+          for(const msg of messages){
+            if(msg.groupedId!=null){
+              const albumKey=String(msg.groupedId);
+              if(seen.has('album:'+albumKey))continue;
+              seen.add('album:'+albumKey);
+              try{
+                const around=await client.getMessages(source,{limit:20,around:Number(msg.id)});
+                const album=around.filter(x=>x && x.groupedId!=null && String(x.groupedId)===albumKey);
+                for(const item of album)expanded.push(item);
+                if(!album.length)expanded.push(msg);
+              }catch{
+                expanded.push(msg);
+              }
+            }else{
+              expanded.push(msg);
+            }
+          }
+
+          const uniqueMessages=[...new Map(expanded.map(msg=>[Number(msg.id),msg])).values()]
+            .sort((a,b)=>Number(a.id)-Number(b.id));
+          const out=await sendTelegramMessagesWithoutSource(client,target,uniqueMessages);
           const arr=Array.isArray(out)?out:[out];
 
           for(let i=0;i<ids.length;i++){
-            await markForwarded(taskId,ids[i],Number(arr[i]?.id||0));
-            await p.query('UPDATE forward_tasks SET history_processed=history_processed+1,history_next_id=? WHERE id=? AND admin_id=?',[ids[i]+1,taskId,userId]);
+            const id=ids[i];
+            const pos=uniqueMessages.findIndex(msg=>Number(msg.id)===id);
+            await markForwarded(taskId,id,Number(arr[pos]?.id||0));
+            await p.query('UPDATE forward_tasks SET history_processed=history_processed+1,history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
           }
         }catch(err){
-          console.error('历史批量转发失败，逐条重试',taskId,err?.message||err);
+          console.error('历史无来源转发失败，逐条重试',taskId,err?.message||err);
 
           for(const id of ids){
             try{
-              const out=await client.forwardMessages(target,{messages:[id],fromPeer:source});
+              const got=await client.getMessages(source,{ids:[id]});
+              const msg=Array.isArray(got)?got[0]:got;
+              if(!msg)throw new Error('消息不存在');
+              const out=await sendTelegramMessagesWithoutSource(client,target,[msg]);
               const one=Array.isArray(out)?out[0]:out;
               await markForwarded(taskId,id,Number(one?.id||0));
               await p.query('UPDATE forward_tasks SET history_processed=history_processed+1,history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
             }catch(singleErr){
-              console.error('历史单条转发失败',taskId,id,singleErr?.message||singleErr);
+              console.error('历史单条无来源转发失败',taskId,id,singleErr?.message||singleErr);
               await p.query('UPDATE forward_tasks SET history_processed=history_processed+1,history_failed=history_failed+1,history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
             }
           }
