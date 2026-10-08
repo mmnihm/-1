@@ -770,7 +770,7 @@ function applyContentFiltersToMessage(message, filters) {
   }
   const value=applyContentFiltersToText(text,filters);
   if(value===null)return null;
-  if(value===text)return message;
+  if(value===text && !(filters?.remove_links===true && messageHasLink(message))) return message;
   const clone=Object.create(Object.getPrototypeOf(message));
   Object.assign(clone,message);
   clone.message=value;
