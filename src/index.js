@@ -721,8 +721,8 @@ bot.on('text', async (ctx, next) => {
 
   if(session.step==='tg_phone'){
     const rawPhone=String(ctx.message.text||'').trim();
-    const phone=rawPhone.replace(/[\s()\-]/g,'');
-    if(!/^\+?\d{7,15}$/.test(phone))return ctx.reply('❌ 手机号格式不正确，请输入完整手机号，例如：+8613812345678');
+    const phone=rawPhone.replace(/[^\d+]/g,'');
+    if(!phone)return ctx.reply('❌ 请输入手机号。');
     session.phone=phone;
     runTelegramBotLogin(uid).catch(err=>{
       console.error('用户 Telegram 登录失败',uid,err?.message||err);
