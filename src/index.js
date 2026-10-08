@@ -505,16 +505,16 @@ async function showTasks(ctx) {
   return ctx.reply('📋 转发任务\n\n' + lines.join('\n\n'), menu(ctx.from.id));
 }
 
-bot.start(async ctx=>ctx.reply('🤖 Telegram 转发机器人\\n\\n每个用户独立登录自己的 Telegram 账号。\\n登录后可自行设置源频道、目标频道和同步任务。',menu(ctx.from.id)));
+bot.start(async ctx=>ctx.reply('🤖 Telegram 转发机器人\n\n每个用户独立登录自己的 Telegram 账号。\n登录后可自行设置源频道、目标频道和同步任务。',menu(ctx.from.id)));
 bot.command('menu',async ctx=>ctx.reply('🤖 主菜单',menu(ctx.from.id)));
 
 bot.action('tg_login',async ctx=>{
   const uid=Number(ctx.from.id);
   await ctx.answerCbQuery();
-  if(userClients.has(uid))return ctx.reply('✅ 你的 Telegram 账号已经登录。\\n\\n可以直接添加任务。',menu(uid));
-  if(!TG_API_ID||!TG_API_HASH)return ctx.reply('❌ 服务器尚未配置 TG_API_ID / TG_API_HASH。\\n\\n普通用户不需要填写 API ID/API Hash，请管理员在 VPS 的 .env 中配置一次。');
+  if(userClients.has(uid))return ctx.reply('✅ 你的 Telegram 账号已经登录。\n\n可以直接添加任务。',menu(uid));
+  if(!TG_API_ID||!TG_API_HASH)return ctx.reply('❌ 服务器尚未配置 TG_API_ID / TG_API_HASH。\n\n普通用户不需要填写 API ID/API Hash，请管理员在 VPS 的 .env 中配置一次。');
   sessions.set(uid,{step:'tg_phone'});
-  return ctx.reply('🔐 Telegram账号登录\\n\\n普通用户无需填写 API ID 和 API Hash。\\n请输入你自己的 Telegram 手机号（含国家区号，例如 +8613812345678）。');
+  return ctx.reply('🔐 Telegram账号登录\n\n普通用户无需填写 API ID 和 API Hash。\n请输入你自己的 Telegram 手机号（含国家区号，例如 +8613812345678）。');
 });
 
 bot.action('tg_logout',async ctx=>{
@@ -535,7 +535,7 @@ bot.action('add_task',async ctx=>{
   }
   sessions.set(uid,{step:'source'});
   await ctx.answerCbQuery();
-  return ctx.reply('➕ 添加转发任务\\n\\n第1步：发送【源频道/群】的 ID、@用户名或 t.me 链接。\\n第2步：再发送【目标频道/群】。');
+  return ctx.reply('➕ 添加转发任务\n\n第1步：发送【源频道/群】的 ID、@用户名或 t.me 链接。\n第2步：再发送【目标频道/群】。');
 });
 
 bot.action('start_sync', async ctx => {
@@ -733,7 +733,7 @@ bot.action('set_history', async ctx => {
   if (!rows.length) return ctx.answerCbQuery('没有任务');
   await ctx.answerCbQuery();
   return ctx.reply(
-    '🕘 设置历史范围\\n\\n先选择要设置的任务：',
+    '🕘 设置历史范围\n\n先选择要设置的任务：',
     Markup.inlineKeyboard(rows.map(t => [
       Markup.button.callback(`#${t.id} ${t.source_chat_id} → ${t.target_chat_id}`, `history_task_${t.id}`)
     ]))
@@ -749,7 +749,7 @@ bot.action(/^history_task_(\d+)$/, async ctx => {
   sessions.set(uid, { step: 'history_start', taskId });
   await ctx.answerCbQuery();
   return ctx.reply(
-    '🕘 设置历史范围\\n\\n请发送【起始消息】。\\n\\n支持：\\n• 直接转发源频道的一条消息给我\\n• 粘贴消息链接\\n• 直接发送消息 ID\\n\\n收到起点后，我再让你发送结束消息。'
+    '🕘 设置历史范围\n\n请发送【起始消息】。\n\n支持：\n• 直接转发源频道的一条消息给我\n• 粘贴消息链接\n• 直接发送消息 ID\n\n收到起点后，我再让你发送结束消息。'
   );
 });
 
@@ -766,7 +766,7 @@ bot.on('text', async (ctx, next) => {
     runTelegramBotLogin(uid).catch(err=>{
       console.error('用户 Telegram 登录失败',uid,err?.message||err);
       sessions.delete(uid);
-      bot.telegram.sendMessage(uid,`❌ Telegram 登录失败：${err?.message||err}\\n\\n请重新点击“🔐 Telegram账号登录”。`,menu(uid)).catch(()=>{});
+      bot.telegram.sendMessage(uid,`❌ Telegram 登录失败：${err?.message||err}\n\n请重新点击“🔐 Telegram账号登录”。`,menu(uid)).catch(()=>{});
     });
     return ctx.reply('⏳ 正在请求 Telegram 验证码，请稍候……');
   }
@@ -807,11 +807,11 @@ bot.on('text', async (ctx, next) => {
           [startId, endId, total, taskId, uid]
         );
         sessions.delete(uid);
-        return ctx.reply(`✅ 已设置任务 #${taskId}\\n历史范围：${startId} → ${endId}\\n总数：${total}\\n\\n现在点击“▶️ 开始同步”。`, menu(uid));
+        return ctx.reply(`✅ 已设置任务 #${taskId}\n历史范围：${startId} → ${endId}\n总数：${total}\n\n现在点击“▶️ 开始同步”。`, menu(uid));
       }
       session.historyStartId = Number(ids[0]);
       session.step = 'history_end';
-      return ctx.reply(`✅ 已收到起始消息：${session.historyStartId}\\n\\n现在请发送【结束消息】：\\n• 直接转发一条源频道消息\\n• 粘贴消息链接\\n• 发送消息 ID`);
+      return ctx.reply(`✅ 已收到起始消息：${session.historyStartId}\n\n现在请发送【结束消息】：\n• 直接转发一条源频道消息\n• 粘贴消息链接\n• 发送消息 ID`);
     }
 
     const startId = Number(session.historyStartId);
@@ -829,7 +829,7 @@ bot.on('text', async (ctx, next) => {
       [startId, endId, total, taskId, uid]
     );
     sessions.delete(uid);
-    return ctx.reply(`✅ 已设置任务 #${taskId}\\n历史范围：${startId} → ${endId}\\n总数：${total}\\n\\n现在点击“▶️ 开始同步”。`, menu(uid));
+    return ctx.reply(`✅ 已设置任务 #${taskId}\n历史范围：${startId} → ${endId}\n总数：${total}\n\n现在点击“▶️ 开始同步”。`, menu(uid));
   }
 
   const chat = cleanChatId(ctx.message.text);
@@ -898,7 +898,7 @@ async function runTelegramBotLogin(userId){
       await attachTelegramEvents(client,uid);
       userClients.set(uid,client);
       sessions.delete(uid);
-      return bot.telegram.sendMessage(uid,'✅ Telegram账号登录成功！\\n\\n以后你的任务都会使用这个 Telegram 账号执行。\\nVPS 重启后会自动恢复登录状态。',menu(uid));
+      return bot.telegram.sendMessage(uid,'✅ Telegram账号登录成功！\n\n以后你的任务都会使用这个 Telegram 账号执行。\nVPS 重启后会自动恢复登录状态。',menu(uid));
     }
 
     console.log('Telegram 登录：开始请求验证码',uid,phone);
@@ -915,7 +915,7 @@ async function runTelegramBotLogin(userId){
       uid,
       'tg_code',
       'codeResolve',
-      '📲 Telegram 验证码请求已成功发送。\\n\\n请查看你其他已登录设备里的“Telegram”官方服务消息；如果 Telegram 显示验证码，也可以直接把验证码发给我。'
+      '📲 Telegram 验证码请求已成功发送。\n\n请查看你其他已登录设备里的“Telegram”官方服务消息；如果 Telegram 显示验证码，也可以直接把验证码发给我。'
     );
 
     let signedIn=false;
@@ -950,7 +950,7 @@ async function runTelegramBotLogin(userId){
     userClients.set(uid,client);
     sessions.delete(uid);
     console.log('Telegram 登录成功',uid);
-    return bot.telegram.sendMessage(uid,'✅ Telegram账号登录成功！\\n\\n以后你的任务都会使用这个 Telegram 账号执行。\\nVPS 重启后会自动恢复登录状态。',menu(uid));
+    return bot.telegram.sendMessage(uid,'✅ Telegram账号登录成功！\n\n以后你的任务都会使用这个 Telegram 账号执行。\nVPS 重启后会自动恢复登录状态。',menu(uid));
   }catch(err){
     try{await client.disconnect();}catch{}
     throw err;
