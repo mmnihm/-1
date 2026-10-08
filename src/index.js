@@ -207,7 +207,9 @@ async function attachTelegramEvents(client, ownerId) {
   client.addEventHandler(async event=>{
     try{
       const message=event.message;
-      const sourceChatId=message?.chatId!=null?Number(message.chatId):null;
+      const sourceChatId = message?.peerId
+        ? Number(await client.getPeerId(message.peerId))
+        : (message?.chatId!=null ? Number(message.chatId) : null);
       if(!message?.id||sourceChatId==null)return;
       const p=await db();
 
@@ -251,6 +253,37 @@ async function attachTelegramEvents(client, ownerId) {
   },new NewMessage({}));
 }
 
+async function repairLegacyTaskChatIds(userId) {
+  const uid=Number(userId);
+  const p=await db();
+  const [rows]=await p.query(
+    'SELECT id,source_chat_id,target_chat_id FROM forward_tasks WHERE admin_id=?',
+    [uid]
+  );
+  for(const row of rows){
+    const convert=(value)=>{
+      const n=Number(value);
+      if(!Number.isSafeInteger(n))return n;
+      // 旧版本错误生成：-1000000000000 + 原频道 ID
+      // 这类值通常以 -99... 开头；正确格式应为 -100 + 原频道 ID。
+      if(n < -900000000000 && n > -1000000000000){
+        const raw=n+1000000000000;
+        if(raw>0)return Number('-100'+String(raw));
+      }
+      return n;
+    };
+    const source=convert(row.source_chat_id);
+    const target=convert(row.target_chat_id);
+    if(source!==Number(row.source_chat_id)||target!==Number(row.target_chat_id)){
+      await p.query(
+        'UPDATE forward_tasks SET source_chat_id=?,target_chat_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND admin_id=?',
+        [source,target,Number(row.id),uid]
+      );
+      console.log('已修复旧版频道 ID',Number(row.id),row.source_chat_id,'→',source,row.target_chat_id,'→',target);
+    }
+  }
+}
+
 async function startTelegramUserClient(userId) {
   const uid=Number(userId);
   const saved=await getTelegramAuth(uid);
@@ -265,6 +298,7 @@ async function startTelegramUserClient(userId) {
     const client=new TelegramClient(new StringSession(tgSession),Number(apiId),apiHash,{connectionRetries:5});
     await client.connect();
     if(!(await client.checkAuthorization()))throw new Error('Telegram 登录会话无效，请重新登录');
+    await repairLegacyTaskChatIds(uid);
     await attachTelegramEvents(client,uid);
     userClients.set(uid,client);
     return client;
@@ -881,13 +915,15 @@ function cleanChatId(value) {
 async function resolveChatId(value, client) {
   const cleaned=cleanChatId(value);
   if(!cleaned)throw new Error('频道/群不能为空');
-  if(typeof cleaned==='number')return cleaned;
   if(!client)throw new Error('请先登录 Telegram');
+
+  // 统一保存为 GramJS 官方的 Bot API 风格 ID：
+  // 用户：123；普通群：-123；频道/超级群：-100123...
+  // 不再手工使用 -1000000000000 + id，这会生成错误的频道 ID。
   const entity=await client.getEntity(cleaned);
-  const id=Number(entity?.id);
-  if(!Number.isFinite(id))throw new Error('无法获取频道/群 ID');
-  if(entity.className==='Channel')return -1000000000000+id;
-  if(entity.className==='Chat')return -id;
+  const peerId=await client.getPeerId(entity);
+  const id=Number(peerId);
+  if(!Number.isSafeInteger(id))throw new Error('无法获取有效的频道/群 ID');
   return id;
 }
 
@@ -1830,6 +1866,7 @@ async function runTelegramBotLogin(userId){
     await saveTelegramAuth(uid,TG_API_ID,TG_API_HASH,client.session.save());
     const old=userClients.get(uid);
     if(old){try{await old.disconnect();}catch{}}
+    await repairLegacyTaskChatIds(uid);
     await attachTelegramEvents(client,uid);
     userClients.set(uid,client);
     sessions.delete(uid);
