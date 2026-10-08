@@ -150,6 +150,24 @@ async function db() {
     `);
 
     await pool.query(`
+      CREATE TABLE IF NOT EXISTS telegram_discussion_maps (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        task_id BIGINT UNSIGNED NOT NULL,
+        source_post_id BIGINT NOT NULL,
+        source_discussion_chat_id BIGINT NOT NULL,
+        source_discussion_root_id BIGINT NOT NULL,
+        target_post_id BIGINT NOT NULL,
+        target_discussion_chat_id BIGINT NOT NULL,
+        target_discussion_root_id BIGINT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY uq_discussion_post (task_id, source_post_id),
+        UNIQUE KEY uq_discussion_root (task_id, source_discussion_chat_id, source_discussion_root_id),
+        KEY idx_discussion_chat (task_id, source_discussion_chat_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `);
+
+    await pool.query(`
       INSERT IGNORE INTO bot_users (user_id, status)
       SELECT admin_id, 'authorized' FROM telegram_auth
     `);
@@ -429,6 +447,154 @@ function getDirectReplyMessageId(message, topicId) {
   return replyId;
 }
 
+
+async function getDiscussionRoot(client, channelEntity, postId) {
+  try {
+    const result = await client.invoke(new Api.messages.GetDiscussionMessage({
+      peer: channelEntity,
+      msgId: Number(postId)
+    }));
+    const root = result?.messages?.[0];
+    if (!root?.id || root.chatId == null) return null;
+    const chat = await client.getEntity(Number(root.chatId));
+    return { root, chat };
+  } catch (err) {
+    if (!/MSG_ID_INVALID|CHANNEL_INVALID|PEER_ID_INVALID/i.test(String(err?.message || ''))) {
+      console.error('读取频道评论区失败', postId, err?.message || err);
+    }
+    return null;
+  }
+}
+
+async function ensureDiscussionMessageTable() {
+  const p = await db();
+  await p.query('CREATE TABLE IF NOT EXISTS telegram_discussion_message_maps (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, task_id BIGINT UNSIGNED NOT NULL, source_chat_id BIGINT NOT NULL, source_message_id BIGINT NOT NULL, target_chat_id BIGINT NOT NULL, target_message_id BIGINT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY uq_discussion_message (task_id, source_chat_id, source_message_id), KEY idx_discussion_parent (task_id, source_chat_id, source_message_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+}
+
+async function sendDiscussionMessage(client, targetChat, message, replyTo=0) {
+  const options = replyTo > 0 ? { replyTo } : {};
+  if (message?.media) {
+    return await client.sendFile(targetChat, {
+      file: message.media,
+      caption: String(message.message || ''),
+      ...options
+    });
+  }
+  if (message?.message) {
+    return await client.sendMessage(targetChat, {
+      message: String(message.message),
+      ...options
+    });
+  }
+  return null;
+}
+
+async function cloneDiscussionComments(client, task, sourceChannel, sourcePostId, targetPostId) {
+  const filters = parseFilters(task.filters_json);
+  if (filters.clone_comments === false) return;
+  await ensureDiscussionMessageTable();
+
+  const sourceInfo = await getDiscussionRoot(client, sourceChannel, sourcePostId);
+  if (!sourceInfo) return;
+  const targetChannel = await client.getEntity(Number(task.target_chat_id));
+  const targetInfo = await getDiscussionRoot(client, targetChannel, targetPostId);
+  if (!targetInfo) {
+    console.log('目标频道没有可用评论区，跳过评论同步', task.id, targetPostId);
+    return;
+  }
+
+  const p = await db();
+  await p.query('INSERT INTO telegram_discussion_maps (task_id,source_post_id,source_discussion_chat_id,source_discussion_root_id,target_post_id,target_discussion_chat_id,target_discussion_root_id) VALUES (?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE target_post_id=VALUES(target_post_id),target_discussion_chat_id=VALUES(target_discussion_chat_id),target_discussion_root_id=VALUES(target_discussion_root_id)',
+    [Number(task.id),Number(sourcePostId),Number(sourceInfo.root.chatId),Number(sourceInfo.root.id),Number(targetPostId),Number(targetInfo.root.chatId),Number(targetInfo.root.id)]);
+
+  let result;
+  try {
+    result = await client.invoke(new Api.messages.GetReplies({
+      peer: sourceInfo.chat,
+      msgId: Number(sourceInfo.root.id),
+      offsetId: 0,
+      offsetDate: 0,
+      addOffset: 0,
+      limit: 100,
+      maxId: 0,
+      minId: 0,
+      hash: BigInt(0)
+    }));
+  } catch (err) {
+    console.error('读取历史评论失败', task.id, sourcePostId, err?.message || err);
+    return;
+  }
+
+  const comments = [...(result?.messages || [])]
+    .filter(m => Number(m?.id || 0) > 0 && Number(m.id) !== Number(sourceInfo.root.id))
+    .sort((a,b) => Number(a.id)-Number(b.id));
+
+  for (const comment of comments) {
+    const [exists] = await p.query('SELECT target_message_id FROM telegram_discussion_message_maps WHERE task_id=? AND source_chat_id=? AND source_message_id=? LIMIT 1',
+      [Number(task.id),Number(comment.chatId),Number(comment.id)]);
+    if (exists.length) continue;
+
+    let replyTo = Number(targetInfo.root.id);
+    const sourceReplyId = getDirectReplyMessageId(comment, Number(sourceInfo.root.id));
+    if (sourceReplyId > 0) {
+      const [parent] = await p.query('SELECT target_message_id FROM telegram_discussion_message_maps WHERE task_id=? AND source_chat_id=? AND source_message_id=? LIMIT 1',
+        [Number(task.id),Number(comment.chatId),Number(sourceReplyId)]);
+      if (parent.length) replyTo = Number(parent[0].target_message_id);
+    }
+
+    try {
+      const sent = await sendDiscussionMessage(client, targetInfo.chat, comment, replyTo);
+      if (!sent?.id) continue;
+      await p.query('INSERT IGNORE INTO telegram_discussion_message_maps (task_id,source_chat_id,source_message_id,target_chat_id,target_message_id) VALUES (?,?,?,?,?)',
+        [Number(task.id),Number(comment.chatId),Number(comment.id),Number(targetInfo.root.chatId),Number(sent.id)]);
+    } catch (err) {
+      console.error('同步评论失败', task.id, comment.id, err?.message || err);
+    }
+  }
+}
+
+async function forwardDiscussionRealtime(task, sourceChatId, messageId, ownerId) {
+  const client = userClients.get(Number(ownerId));
+  if (!client) return;
+  await ensureDiscussionMessageTable();
+  const p = await db();
+  const [maps] = await p.query('SELECT * FROM telegram_discussion_maps WHERE task_id=? AND source_discussion_chat_id=? ORDER BY id DESC LIMIT 50',
+    [Number(task.id),Number(sourceChatId)]);
+  if (!maps.length) return;
+
+  const sourceChat = await client.getEntity(Number(sourceChatId));
+  const got = await client.getMessages(sourceChat,{ids:[Number(messageId)]});
+  const message = Array.isArray(got) ? got[0] : got;
+  if (!message) return;
+
+  const filters = parseFilters(task.filters_json);
+  if (filters.clone_comments === false || !filters[getGramJsMessageType(message)]) return;
+
+  const [exists] = await p.query('SELECT target_message_id FROM telegram_discussion_message_maps WHERE task_id=? AND source_chat_id=? AND source_message_id=? LIMIT 1',
+    [Number(task.id),Number(sourceChatId),Number(messageId)]);
+  if (exists.length) return;
+
+  for (const map of maps) {
+    let replyTo = Number(map.target_discussion_root_id);
+    const sourceReplyId = getDirectReplyMessageId(message, Number(map.source_discussion_root_id));
+    if (sourceReplyId > 0) {
+      const [parent] = await p.query('SELECT target_message_id FROM telegram_discussion_message_maps WHERE task_id=? AND source_chat_id=? AND source_message_id=? LIMIT 1',
+        [Number(task.id),Number(sourceChatId),Number(sourceReplyId)]);
+      if (parent.length) replyTo = Number(parent[0].target_message_id);
+    }
+    try {
+      const targetChat = await client.getEntity(Number(map.target_discussion_chat_id));
+      const sent = await sendDiscussionMessage(client,targetChat,message,replyTo);
+      if (!sent?.id) continue;
+      await p.query('INSERT IGNORE INTO telegram_discussion_message_maps (task_id,source_chat_id,source_message_id,target_chat_id,target_message_id) VALUES (?,?,?,?,?)',
+        [Number(task.id),Number(sourceChatId),Number(messageId),Number(map.target_discussion_chat_id),Number(sent.id)]);
+    } catch (err) {
+      console.error('实时评论同步失败',task.id,messageId,err?.message||err);
+    }
+    break;
+  }
+}
+
 async function forwardTelegramMessages(task, sourceChatId, messageIds, ownerId) {
   const client=userClients.get(Number(ownerId));
   if(!client)return;
@@ -472,7 +638,12 @@ async function forwardTelegramMessages(task, sourceChatId, messageIds, ownerId) 
     const forwarded = Array.isArray(result) ? result : [result];
 
     for (let i = 0; i < pending.length; i++) {
-      await markForwarded(task.id, pending[i].id, Number(forwarded[i]?.id || 0));
+      const targetId = Number(forwarded[i]?.id || 0);
+      await markForwarded(task.id, pending[i].id, targetId);
+      if (targetId > 0 && parseFilters(task.filters_json).clone_comments !== false && source?.className === 'Channel') {
+        try { await cloneDiscussionComments(client, task, source, pending[i].id, targetId); }
+        catch (discussionErr) { console.error('实时评论区初始化失败',task.id,pending[i].id,discussionErr?.message||discussionErr); }
+      }
     }
 
     await p.query(
@@ -496,7 +667,6 @@ async function forwardTelegramMessages(task, sourceChatId, messageIds, ownerId) 
 }
 
 function getGramJsMessageType(message) {
-  if (message?.message) return 'text';
   if (message?.photo) return 'photo';
   if (message?.video) return 'video';
   if (message?.document) return 'document';
@@ -505,6 +675,7 @@ function getGramJsMessageType(message) {
   if (message?.gif) return 'animation';
   if (message?.sticker) return 'sticker';
   if (message?.videoNote) return 'video_note';
+  if (message?.message) return 'text';
   return 'other';
 }
 
@@ -757,6 +928,9 @@ async function syncTask(task) {
           const arr=Array.isArray(out)?out:[out];
           const sentMessageId=Number(arr.find(Boolean)?.id||0);
           await markForwarded(taskId,id,sentMessageId);
+          if (sentMessageId > 0 && filters.clone_comments !== false && source.className === 'Channel') {
+            await cloneDiscussionComments(client, task, source, id, sentMessageId);
+          }
           await p.query(
             'UPDATE forward_tasks SET history_processed=history_processed+1,history_next_id=? WHERE id=? AND admin_id=?',
             [id+1,taskId,userId]
@@ -1257,6 +1431,58 @@ bot.action(/^history_task_(\d+)$/, async ctx => {
   );
 });
 
+
+async function processHistoryInput(ctx) {
+  const uid=Number(ctx.from.id);
+  const session=sessions.get(uid);
+  if (!session || (session.step!=='history_start' && session.step!=='history_end')) return false;
+
+  const forwardedId=extractHistoryMessageId(ctx.message);
+  const ids=forwardedId ? [forwardedId] : extractHistoryIdsFromText(ctx.message?.text);
+  if (!ids.length) {
+    await ctx.reply('❌ 没识别到消息。请直接转发源频道消息、粘贴 t.me 消息链接，或发送消息 ID。');
+    return true;
+  }
+
+  const taskId=Number(session.taskId);
+  const p=await db();
+  const [rows]=await p.query('SELECT * FROM forward_tasks WHERE id=? AND admin_id=?',[taskId,uid]);
+  if(!rows.length){
+    sessions.delete(uid);
+    await ctx.reply('❌ 找不到这个任务。',menu(uid));
+    return true;
+  }
+
+  if(session.step==='history_start'){
+    if(ids.length>=2){
+      const startId=Number(ids[0]), endId=Number(ids[1]);
+      if(endId<startId){ await ctx.reply('❌ 结束消息不能小于起始消息，请重新发送。'); return true; }
+      const total=endId-startId+1;
+      await p.query('UPDATE forward_tasks SET history_next_id=?,history_end_id=?,history_total=?,history_processed=0,history_skipped=0,history_failed=0,history_done=0,status="paused" WHERE id=? AND admin_id=?',
+        [startId,endId,total,taskId,uid]);
+      sessions.delete(uid);
+      await ctx.reply('✅ 已设置任务 #'+taskId+'\n历史范围：'+startId+' → '+endId+'\n总数：'+total+'\n\n现在点击“▶️ 开始同步”。',menu(uid));
+      return true;
+    }
+    session.historyStartId=Number(ids[0]);
+    session.step='history_end';
+    await ctx.reply('✅ 已收到起始消息：'+session.historyStartId+'\n\n现在请发送【结束消息】：\n• 直接转发一条源频道消息\n• 粘贴消息链接\n• 发送消息 ID');
+    return true;
+  }
+
+  const startId=Number(session.historyStartId), endId=Number(ids[0]);
+  if(!Number.isInteger(startId)||!Number.isInteger(endId)||startId<1||endId<startId){
+    await ctx.reply('❌ 结束消息必须不小于起始消息（当前起点：'+startId+'）。请重新发送结束消息。');
+    return true;
+  }
+  const total=endId-startId+1;
+  await p.query('UPDATE forward_tasks SET history_next_id=?,history_end_id=?,history_total=?,history_processed=0,history_skipped=0,history_failed=0,history_done=0,status="paused" WHERE id=? AND admin_id=?',
+    [startId,endId,total,taskId,uid]);
+  sessions.delete(uid);
+  await ctx.reply('✅ 已设置任务 #'+taskId+'\n历史范围：'+startId+' → '+endId+'\n总数：'+total+'\n\n现在点击“▶️ 开始同步”。',menu(uid));
+  return true;
+}
+
 bot.on('text', async (ctx, next) => {
   const uid=Number(ctx.from.id);
   const session = sessions.get(uid);
@@ -1304,57 +1530,7 @@ bot.on('text', async (ctx, next) => {
 
 
   if (session.step === 'history_start' || session.step === 'history_end') {
-    const forwardedId = extractHistoryMessageId(ctx.message);
-    const ids = forwardedId ? [forwardedId] : extractHistoryIdsFromText(ctx.message.text);
-    if (!ids.length) {
-      return ctx.reply('❌ 没识别到消息。请直接转发源频道消息、粘贴 t.me 消息链接，或发送消息 ID。');
-    }
-
-    const taskId = Number(session.taskId);
-    const p = await db();
-    const [rows] = await p.query('SELECT * FROM forward_tasks WHERE id=? AND admin_id=?', [taskId, uid]);
-    if (!rows.length) {
-      sessions.delete(uid);
-      return ctx.reply('❌ 找不到这个任务。', menu(uid));
-    }
-
-    if (session.step === 'history_start') {
-      if (ids.length >= 2) {
-        const startId = Number(ids[0]);
-        const endId = Number(ids[1]);
-        if (endId < startId) return ctx.reply('❌ 结束消息不能小于起始消息，请重新发送。');
-        const total = endId - startId + 1;
-        await p.query(
-          `UPDATE forward_tasks
-           SET history_next_id=?, history_end_id=?, history_total=?, history_processed=0,
-               history_skipped=0, history_failed=0, history_done=0, status="paused"
-           WHERE id=? AND admin_id=?`,
-          [startId, endId, total, taskId, uid]
-        );
-        sessions.delete(uid);
-        return ctx.reply(`✅ 已设置任务 #${taskId}\n历史范围：${startId} → ${endId}\n总数：${total}\n\n现在点击“▶️ 开始同步”。`, menu(uid));
-      }
-      session.historyStartId = Number(ids[0]);
-      session.step = 'history_end';
-      return ctx.reply(`✅ 已收到起始消息：${session.historyStartId}\n\n现在请发送【结束消息】：\n• 直接转发一条源频道消息\n• 粘贴消息链接\n• 发送消息 ID`);
-    }
-
-    const startId = Number(session.historyStartId);
-    const endId = Number(ids[0]);
-    if (!Number.isInteger(startId) || !Number.isInteger(endId) || startId < 1 || endId < startId) {
-      return ctx.reply(`❌ 结束消息必须不小于起始消息（当前起点：${startId}）。请重新发送结束消息。`);
-    }
-
-    const total = endId - startId + 1;
-    await p.query(
-      `UPDATE forward_tasks
-       SET history_next_id=?, history_end_id=?, history_total=?, history_processed=0,
-           history_skipped=0, history_failed=0, history_done=0, status="paused"
-       WHERE id=? AND admin_id=?`,
-      [startId, endId, total, taskId, uid]
-    );
-    sessions.delete(uid);
-    return ctx.reply(`✅ 已设置任务 #${taskId}\n历史范围：${startId} → ${endId}\n总数：${total}\n\n现在点击“▶️ 开始同步”。`, menu(uid));
+    return processHistoryInput(ctx);
   }
 
   const chat = cleanChatId(ctx.message.text);
@@ -1543,6 +1719,15 @@ async function handleRealtimeMessage(ctx, message, chatId) {
     }
   }
 }
+
+bot.on('message', async ctx => {
+  try {
+    if (ctx.chat?.type !== 'private') return;
+    if (await processHistoryInput(ctx)) return;
+  } catch (err) {
+    console.error('私聊历史范围处理失败', err?.message || err);
+  }
+});
 
 bot.on('channel_post', async ctx => {
   try {
