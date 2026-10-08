@@ -326,7 +326,7 @@ async function ensureTargetForumTopic(client, task, sourceEntity, targetEntity, 
     const created = result?.updates?.find(update =>
       update?.action?.className === 'MessageActionTopicCreate'
     );
-    const targetId = Number(created?.id || created?.message || 0);
+    const targetId = Number(created?.message?.id || created?.id || 0);
     if (!targetId) throw new Error('创建目标话题后未获取到话题 ID');
 
     await p.query(
