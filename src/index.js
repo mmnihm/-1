@@ -328,7 +328,7 @@ function menu(userId) {
     [Markup.button.callback('➕ 添加任务','add_task')],
     [Markup.button.callback('🕘 设置历史范围','set_history')],
     [Markup.button.callback('▶️ 开始同步','start_sync'),Markup.button.callback('⏸ 暂停同步','pause_sync')],
-    [Markup.button.callback('🔄 实时转发','realtime')],
+    [Markup.button.callback('🔄 实时转发','realtime'),Markup.button.callback('⚙️ 同步设置','sync_settings')],
     [Markup.button.callback('🎛 过滤设置','filters'),Markup.button.callback('📊 任务进度','progress')],
     [Markup.button.callback('📋 我的任务','tasks'),Markup.button.callback('🗑 删除任务','delete_task')],
     ...(loggedIn?[[Markup.button.callback('🔓 退出 Telegram账号','tg_logout')]]:[])
@@ -719,6 +719,69 @@ bot.action('progress', async ctx => {
   return ctx.reply('📊 任务进度\n\n' + text, menu(ctx.from.id));
 });
 
+bot.action('sync_settings', async ctx => {
+  const rows = await getTasks(ctx.from.id);
+  if (!rows.length) return ctx.answerCbQuery('没有任务');
+  await ctx.answerCbQuery();
+  return ctx.reply(
+    '⚙️ 同步设置\\n\\n请选择要设置的任务：',
+    Markup.inlineKeyboard(rows.map(t => [
+      Markup.button.callback(`#${t.id} ${t.source_chat_id} → ${t.target_chat_id}`, `syncset_task_${t.id}`)
+    ]))
+  );
+});
+
+bot.action(/^syncset_task_(\\d+)$/, async ctx => {
+  const taskId = Number(ctx.match[1]);
+  const p = await db();
+  const [rows] = await p.query('SELECT filters_json,realtime FROM forward_tasks WHERE id=? AND admin_id=?',[taskId,Number(ctx.from.id)]);
+  if (!rows.length) return ctx.answerCbQuery('任务不存在');
+  const settings = parseFilters(rows[0].filters_json);
+  const topicClone = settings.clone_topics !== false;
+  const commentClone = settings.clone_comments !== false;
+  const realtime = Number(rows[0].realtime) === 1;
+  await ctx.answerCbQuery();
+  return ctx.reply(
+    `⚙️ 任务 #${taskId} 同步设置\\n\\n🧵 话题群：${topicClone ? '✅ 完整克隆' : '❌ 不克隆'}\\n💬 评论区：${commentClone ? '✅ 克隆' : '❌ 不克隆'}\\n🔄 实时同步：${realtime ? '✅ 开启' : '❌ 关闭'}`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback(`🧵 完整克隆话题群 ${topicClone ? '✅' : '❌'}`,`syncset_${taskId}_topics`)],
+      [Markup.button.callback(`💬 克隆评论区 ${commentClone ? '✅' : '❌'}`,`syncset_${taskId}_comments`)],
+      [Markup.button.callback(`🔄 实时同步 ${realtime ? '✅' : '❌'}`,`syncset_${taskId}_realtime`)],
+      [Markup.button.callback('⬅️ 返回主菜单','menu_back')]
+    ])
+  );
+});
+
+bot.action(/^syncset_(\\d+)_(topics|comments)$/, async ctx => {
+  const taskId = Number(ctx.match[1]);
+  const kind = ctx.match[2];
+  const p = await db();
+  const [rows] = await p.query('SELECT filters_json FROM forward_tasks WHERE id=? AND admin_id=?',[taskId,Number(ctx.from.id)]);
+  if (!rows.length) return ctx.answerCbQuery('任务不存在');
+  const settings = parseFilters(rows[0].filters_json);
+  const key = kind === 'topics' ? 'clone_topics' : 'clone_comments';
+  settings[key] = settings[key] === false;
+  await p.query('UPDATE forward_tasks SET filters_json=? WHERE id=? AND admin_id=?',[JSON.stringify(settings),taskId,Number(ctx.from.id)]);
+  await ctx.answerCbQuery(settings[key] ? '已开启' : '已关闭');
+  return ctx.reply(`⚙️ 任务 #${taskId}：${kind === 'topics' ? '完整克隆话题群' : '克隆评论区'} 已${settings[key] ? '开启' : '关闭'}。`,menu(ctx.from.id));
+});
+
+bot.action(/^syncset_(\\d+)_realtime$/, async ctx => {
+  const taskId = Number(ctx.match[1]);
+  const p = await db();
+  const [rows] = await p.query('SELECT realtime FROM forward_tasks WHERE id=? AND admin_id=?',[taskId,Number(ctx.from.id)]);
+  if (!rows.length) return ctx.answerCbQuery('任务不存在');
+  const enabled = Number(rows[0].realtime) !== 1;
+  await p.query('UPDATE forward_tasks SET realtime=? WHERE id=? AND admin_id=?',[enabled ? 1 : 0,taskId,Number(ctx.from.id)]);
+  await ctx.answerCbQuery(enabled ? '已开启' : '已关闭');
+  return ctx.reply(`⚙️ 任务 #${taskId} 实时同步已${enabled ? '开启' : '关闭'}。`,menu(ctx.from.id));
+});
+
+bot.action('menu_back', async ctx => {
+  await ctx.answerCbQuery();
+  return ctx.reply('🤖 主菜单',menu(ctx.from.id));
+});
+
 bot.action('filters', async ctx => {
   const rows = await getTasks(ctx.from.id);
   if (!rows.length) return ctx.answerCbQuery('没有任务');
@@ -943,7 +1006,7 @@ bot.on('text', async (ctx, next) => {
          (admin_id, source_chat_id, target_chat_id, status, realtime, filters_json)
          VALUES (?, ?, ?, 'paused', 1, ?)
          ON DUPLICATE KEY UPDATE updated_at=CURRENT_TIMESTAMP`,
-        [uid, session.source, target, JSON.stringify(DEFAULT_FILTERS)]
+        [uid, session.source, target, JSON.stringify({...DEFAULT_FILTERS, clone_topics:true, clone_comments:true})]
       );
 
       const source = session.source;
