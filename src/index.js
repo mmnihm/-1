@@ -1098,7 +1098,7 @@ bot.action('sync_settings', async ctx => {
   );
 });
 
-bot.action(/^syncset_task_(\\d+)$/, async ctx => {
+bot.action(/^syncset_task_(\d+)$/, async ctx => {
   const taskId = Number(ctx.match[1]);
   const p = await db();
   const [rows] = await p.query('SELECT filters_json,realtime FROM forward_tasks WHERE id=? AND admin_id=?',[taskId,Number(ctx.from.id)]);
@@ -1119,7 +1119,7 @@ bot.action(/^syncset_task_(\\d+)$/, async ctx => {
   );
 });
 
-bot.action(/^syncset_(\\d+)_(topics|comments)$/, async ctx => {
+bot.action(/^syncset_(\d+)_(topics|comments)$/, async ctx => {
   const taskId = Number(ctx.match[1]);
   const kind = ctx.match[2];
   const p = await db();
@@ -1133,7 +1133,7 @@ bot.action(/^syncset_(\\d+)_(topics|comments)$/, async ctx => {
   return ctx.reply(`⚙️ 任务 #${taskId}：${kind === 'topics' ? '完整克隆话题群' : '克隆评论区'} 已${settings[key] ? '开启' : '关闭'}。`,menu(ctx.from.id));
 });
 
-bot.action(/^syncset_(\\d+)_realtime$/, async ctx => {
+bot.action(/^syncset_(\d+)_realtime$/, async ctx => {
   const taskId = Number(ctx.match[1]);
   const p = await db();
   const [rows] = await p.query('SELECT realtime FROM forward_tasks WHERE id=? AND admin_id=?',[taskId,Number(ctx.from.id)]);
