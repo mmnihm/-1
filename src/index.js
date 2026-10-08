@@ -47,7 +47,9 @@ const DEFAULT_FILTERS = {
   animation: true,
   sticker: true,
   video_note: true,
-  other: true
+  other: true,
+  block_forwarded: false,
+  replace_rules: []
 };
 
 async function db() {
@@ -227,7 +229,7 @@ async function attachTelegramEvents(client, ownerId) {
       for(const task of tasks){
         if(Number(task.target_chat_id)===sourceChatId)continue;
         const filters=parseFilters(task.filters_json);
-        if(!filters[getGramJsMessageType(message)])continue;
+        if(!shouldForwardMessage(message,filters))continue;
         if(message.groupedId!=null){
           const key=`album:${task.id}:${sourceChatId}:${String(message.groupedId)}`;
           let queue=albumQueues.get(key);
@@ -381,8 +383,8 @@ async function ensureTargetForumTopic(client, task, sourceEntity, targetEntity, 
   }
 }
 
-async function sendTelegramMessagesWithoutSource(client, target, messages, topicResolver = null, replyResolver = null) {
-  const list = [...messages].filter(Boolean);
+async function sendTelegramMessagesWithoutSource(client, target, messages, topicResolver = null, replyResolver = null, filters = null) {
+  const list = [...messages].filter(Boolean).map(msg => applyReplaceRulesToMessage(msg, filters));
   if (!list.length) return [];
 
   const sent = [];
@@ -607,7 +609,7 @@ async function forwardDiscussionRealtime(task, sourceChatId, messageId, ownerId)
   if (!message) return;
 
   const filters = parseFilters(task.filters_json);
-  if (filters.clone_comments === false || !filters[getGramJsMessageType(message)]) return;
+  if (filters.clone_comments === false || !shouldForwardMessage(message,filters)) return;
 
   const reply = message?.replyTo;
   const rootId = Number(reply?.replyToTopId || reply?.replyToMsgId || 0);
@@ -734,6 +736,28 @@ function getGramJsMessageType(message) {
   if (message?.videoNote) return 'video_note';
   if (message?.message) return 'text';
   return 'other';
+}
+
+function isForwardedGramMessage(message) {
+  return !!(message?.fwdFrom || message?.forwardHeader || message?.forwardFrom);
+}
+function applyReplaceRulesToMessage(message, filters) {
+  const rules=Array.isArray(filters?.replace_rules)?filters.replace_rules:[];
+  if(!rules.length||!message)return message;
+  const clone=Object.create(Object.getPrototypeOf(message));
+  Object.assign(clone,message);
+  let text=String(message.message||'');
+  for(const rule of rules){
+    const from=String(rule?.from??''); const to=String(rule?.to??'');
+    if(from) text=text.split(from).join(to);
+  }
+  clone.message=text;
+  return clone;
+}
+function shouldForwardMessage(message,filters){
+  if(!message)return false;
+  if(filters?.block_forwarded===true && isForwardedGramMessage(message))return false;
+  return !!filters[getGramJsMessageType(message)];
 }
 
 function isAdmin(ctx) {
@@ -879,7 +903,9 @@ function filterText(filters) {
     video_note: '视频消息',
     other: '其他'
   };
-  return Object.keys(labels).map(k => `${filters[k] ? '✅' : '❌'}${labels[k]}`).join('  ');
+  const media=Object.keys(labels).map(k => `${filters[k] ? '✅' : '❌'}${labels[k]}`).join('  ');
+  const count=Array.isArray(filters.replace_rules)?filters.replace_rules.length:0;
+  return media+`\n🚫屏蔽转发消息：${filters.block_forwarded?'✅':'❌'}\n🔄关键词/链接替换：${count?'✅ '+count+'条':'❌ 未设置'}`;
 }
 
 async function getTasks(userId) {
@@ -952,7 +978,7 @@ async function syncTask(task) {
             continue;
           }
 
-          if(!filters[getGramJsMessageType(msg)]){
+          if(!shouldForwardMessage(msg,filters)){
             await p.query('UPDATE forward_tasks SET history_processed=history_processed+1,history_skipped=history_skipped+1,history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
             continue;
           }
@@ -1398,12 +1424,14 @@ bot.action(/^filter_task_(\d+)$/, async ctx => {
       [Markup.button.callback(`音频 ${filters.audio ? '✅' : '❌'}`, `ft_${taskId}_audio`), Markup.button.callback(`语音 ${filters.voice ? '✅' : '❌'}`, `ft_${taskId}_voice`)],
       [Markup.button.callback(`动图 ${filters.animation ? '✅' : '❌'}`, `ft_${taskId}_animation`), Markup.button.callback(`贴纸 ${filters.sticker ? '✅' : '❌'}`, `ft_${taskId}_sticker`)],
       [Markup.button.callback(`视频消息 ${filters.video_note ? '✅' : '❌'}`, `ft_${taskId}_video_note`), Markup.button.callback(`其他 ${filters.other ? '✅' : '❌'}`, `ft_${taskId}_other`)],
+      [Markup.button.callback(`🚫 屏蔽转发消息 ${filters.block_forwarded ? '✅' : '❌'}`, `ft_${taskId}_block_forwarded`)],
+      [Markup.button.callback('🔄 关键词/链接替换', `replace_rules_${taskId}`)],
       [Markup.button.callback('⬅️ 返回', 'filters')]
     ])
   );
 });
 
-bot.action(/^ft_(\d+)_(text|photo|video|document|audio|voice|animation|sticker|video_note|other)$/, async ctx => {
+bot.action(/^ft_(\d+)_(text|photo|video|document|audio|voice|animation|sticker|video_note|other|block_forwarded)$/, async ctx => {
   const taskId = Number(ctx.match[1]);
   const type = ctx.match[2];
   const p = await db();
@@ -1415,6 +1443,26 @@ bot.action(/^ft_(\d+)_(text|photo|video|document|audio|voice|animation|sticker|v
   await p.query('UPDATE forward_tasks SET filters_json=? WHERE id=?', [JSON.stringify(filters), taskId]);
   await ctx.answerCbQuery(filters[type] ? '已允许' : '已过滤');
   return ctx.reply(`🎛 任务 #${taskId}\n\n${filterText(filters)}`, menu(ctx.from.id));
+});
+
+bot.action(/^replace_rules_(\d+)$/, async ctx => {
+  const taskId=Number(ctx.match[1]); const uid=Number(ctx.from.id);
+  const p=await db(); const [rows]=await p.query('SELECT filters_json FROM forward_tasks WHERE id=? AND admin_id=?',[taskId,uid]);
+  if(!rows.length)return ctx.answerCbQuery('任务不存在');
+  sessions.set(uid,{step:'replace_rule',taskId});
+  const f=parseFilters(rows[0].filters_json), rules=Array.isArray(f.replace_rules)?f.replace_rules:[];
+  const list=rules.length?rules.map((x,i)=>`${i+1}. ${x.from} → ${x.to}`).join('\n'):'暂无替换规则';
+  await ctx.answerCbQuery();
+  return ctx.reply(`🔄 关键词/链接替换\n\n${list}\n\n发送：原关键词 => 新关键词\n例如：旧域名.com => 新域名.com\n可连续添加，发送“完成”结束。`,
+    Markup.inlineKeyboard([[Markup.button.callback('🗑 清空全部替换','replace_clear_'+taskId)],[Markup.button.callback('⬅️ 返回','filters')]]));
+});
+bot.action(/^replace_clear_(\d+)$/, async ctx => {
+  const taskId=Number(ctx.match[1]),uid=Number(ctx.from.id); const p=await db();
+  const [rows]=await p.query('SELECT filters_json FROM forward_tasks WHERE id=? AND admin_id=?',[taskId,uid]);
+  if(!rows.length)return ctx.answerCbQuery('任务不存在');
+  const f=parseFilters(rows[0].filters_json); f.replace_rules=[];
+  await p.query('UPDATE forward_tasks SET filters_json=? WHERE id=? AND admin_id=?',[JSON.stringify(f),taskId,uid]);
+  sessions.delete(uid); await ctx.answerCbQuery('已清空'); return ctx.reply('✅ 替换规则已清空。',menu(uid));
 });
 
 bot.action('delete_task', async ctx => {
@@ -1543,6 +1591,19 @@ async function processHistoryInput(ctx) {
 bot.on('text', async (ctx, next) => {
   const uid=Number(ctx.from.id);
   const session = sessions.get(uid);
+    if (session?.step === 'replace_rule') {
+      const value=String(ctx.message?.text||'').trim();
+      if(value==='完成'){sessions.delete(uid);return ctx.reply('✅ 替换规则已保存。',menu(uid));}
+      const m=value.match(/^(.+?)\s*(?:=>|->|＝>|→)\s*(.*)$/);
+      if(!m)return ctx.reply('格式不正确，请使用：原关键词 => 新关键词');
+      const p=await db(); const [rows]=await p.query('SELECT filters_json FROM forward_tasks WHERE id=? AND admin_id=?',[session.taskId,uid]);
+      if(!rows.length){sessions.delete(uid);return ctx.reply('任务不存在',menu(uid));}
+      const f=parseFilters(rows[0].filters_json); f.replace_rules=Array.isArray(f.replace_rules)?f.replace_rules:[];
+      f.replace_rules.push({from:m[1],to:m[2]});
+      await p.query('UPDATE forward_tasks SET filters_json=? WHERE id=? AND admin_id=?',[JSON.stringify(f),session.taskId,uid]);
+      return ctx.reply(`✅ 已添加：${m[1]} → ${m[2]}\n继续发送下一条，或发送“完成”。`);
+    }
+
 
   if (session?.step === 'admin_authorize_user') {
     if (uid !== adminId) {
