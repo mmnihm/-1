@@ -205,6 +205,21 @@ async function attachTelegramEvents(client, ownerId) {
       const sourceChatId=message?.chatId!=null?Number(message.chatId):null;
       if(!message?.id||sourceChatId==null)return;
       const p=await db();
+
+      // 先处理频道关联 Discussion 评论区：评论实际发生在关联讨论群。
+      const [discussionTasks]=await p.query(
+        'SELECT DISTINCT t.* FROM forward_tasks t INNER JOIN telegram_discussion_maps d ON d.task_id=t.id WHERE t.admin_id=? AND t.realtime=1 AND d.source_discussion_chat_id=?',
+        [uid,sourceChatId]
+      );
+      for(const task of discussionTasks){
+        try {
+          await forwardDiscussionRealtime(task,sourceChatId,Number(message.id),uid);
+        } catch(err) {
+          console.error('MTProto 评论区实时转发失败',task.id,message.id,err?.message||err);
+        }
+      }
+
+      // 再处理正常源频道/群消息。
       const [tasks]=await p.query(
         'SELECT * FROM forward_tasks WHERE admin_id=? AND source_chat_id=? AND realtime=1',
         [uid,sourceChatId]
@@ -381,17 +396,22 @@ async function sendTelegramMessagesWithoutSource(client, target, messages, topic
       const key = `${String(msg.groupedId)}:${topicId}:${replyTo}`;
       if (!albums.has(key)) albums.set(key, []);
       albums.get(key).push({ msg, topicId, replyTo });
-    } else if (msg.media) {
-      sent.push(await client.sendFile(target, {
-        file: msg.media,
-        caption: String(msg.message || ''),
-        ...(replyTo > 0 ? { replyTo } : {})
-      }));
-    } else if (msg.message) {
-      sent.push(await client.sendMessage(target, {
-        message: String(msg.message),
-        ...(replyTo > 0 ? { replyTo } : {})
-      }));
+    } else {
+      try {
+        sent.push(await client.sendMessage(target, {
+          message: msg,
+          ...(replyTo > 0 ? { replyTo } : {})
+        }));
+      } catch (firstErr) {
+        if (!msg.media) throw firstErr;
+        const buffer = await client.downloadMedia(msg, {});
+        if (!buffer) throw firstErr;
+        sent.push(await client.sendFile(target, {
+          file: buffer,
+          caption: String(msg.message || ''),
+          ...(replyTo > 0 ? { replyTo } : {})
+        }));
+      }
     }
   }
 
@@ -401,22 +421,53 @@ async function sendTelegramMessagesWithoutSource(client, target, messages, topic
     const replyTo = Number(group[0]?.replyTo || 0);
     const media = group.map(item => item.msg).filter(msg => msg.media);
     if (media.length > 1) {
-      const result = await client.sendFile(target, {
-        file: media.map(msg => msg.media),
-        caption: media.map(msg => String(msg.message || '')),
-        ...(replyTo > 0 ? { replyTo } : {})
-      });
-      const arr = Array.isArray(result) ? result : [result];
-      sent.push(...arr);
+      try {
+        const result = await client.sendFile(target, {
+          file: media.map(msg => msg.media),
+          caption: media.map(msg => String(msg.message || '')),
+          ...(replyTo > 0 ? { replyTo } : {})
+        });
+        const arr = Array.isArray(result) ? result : [result];
+        sent.push(...arr);
+      } catch (albumErr) {
+        console.error('相册原媒体发送失败，改用逐条复制', albumErr?.message || albumErr);
+        for (const item of media) {
+          try {
+            sent.push(await client.sendMessage(target, {
+              message: item,
+              ...(replyTo > 0 ? { replyTo } : {})
+            }));
+          } catch (itemErr) {
+            if (!item.media) throw itemErr;
+            const buffer = await client.downloadMedia(item, {});
+            if (!buffer) throw itemErr;
+            sent.push(await client.sendFile(target, {
+              file: buffer,
+              caption: String(item.message || ''),
+              ...(replyTo > 0 ? { replyTo } : {})
+            }));
+          }
+        }
+      }
     } else if (media.length === 1) {
-      sent.push(await client.sendFile(target, {
-        file: media[0].media,
-        caption: String(media[0].message || ''),
-        ...(replyTo > 0 ? { replyTo } : {})
-      }));
-    } else if (group[0]?.msg?.message) {
+      const item = media[0];
+      try {
+        sent.push(await client.sendMessage(target, {
+          message: item,
+          ...(replyTo > 0 ? { replyTo } : {})
+        }));
+      } catch (firstErr) {
+        const buffer = await client.downloadMedia(item, {});
+        if (!buffer) throw firstErr;
+        sent.push(await client.sendFile(target, {
+          file: buffer,
+          caption: String(item.message || ''),
+          ...(replyTo > 0 ? { replyTo } : {})
+        }));
+      }
+    } else if (group[0]?.msg) {
       sent.push(await client.sendMessage(target, {
-        message: String(group[0].msg.message),
+        message: group[0].msg,
         ...(replyTo > 0 ? { replyTo } : {})
       }));
     }
@@ -473,20 +524,18 @@ async function ensureDiscussionMessageTable() {
 
 async function sendDiscussionMessage(client, targetChat, message, replyTo=0) {
   const options = replyTo > 0 ? { replyTo } : {};
-  if (message?.media) {
+  try {
+    return await client.sendMessage(targetChat, { message, ...options });
+  } catch (firstErr) {
+    if (!message?.media) throw firstErr;
+    const buffer = await client.downloadMedia(message, {});
+    if (!buffer) throw firstErr;
     return await client.sendFile(targetChat, {
-      file: message.media,
+      file: buffer,
       caption: String(message.message || ''),
       ...options
     });
   }
-  if (message?.message) {
-    return await client.sendMessage(targetChat, {
-      message: String(message.message),
-      ...options
-    });
-  }
-  return null;
 }
 
 async function cloneDiscussionComments(client, task, sourceChannel, sourcePostId, targetPostId) {
@@ -507,27 +556,20 @@ async function cloneDiscussionComments(client, task, sourceChannel, sourcePostId
   await p.query('INSERT INTO telegram_discussion_maps (task_id,source_post_id,source_discussion_chat_id,source_discussion_root_id,target_post_id,target_discussion_chat_id,target_discussion_root_id) VALUES (?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE target_post_id=VALUES(target_post_id),target_discussion_chat_id=VALUES(target_discussion_chat_id),target_discussion_root_id=VALUES(target_discussion_root_id)',
     [Number(task.id),Number(sourcePostId),Number(sourceInfo.root.chatId),Number(sourceInfo.root.id),Number(targetPostId),Number(targetInfo.root.chatId),Number(targetInfo.root.id)]);
 
-  let result;
+  let comments = [];
   try {
-    result = await client.invoke(new Api.messages.GetReplies({
-      peer: sourceInfo.chat,
-      msgId: Number(sourceInfo.root.id),
-      offsetId: 0,
-      offsetDate: 0,
-      addOffset: 0,
-      limit: 100,
-      maxId: 0,
-      minId: 0,
-      hash: BigInt(0)
-    }));
+    for await (const comment of client.iterMessages(sourceInfo.chat, {
+      replyTo: Number(sourceInfo.root.id)
+    })) {
+      if (comment?.id && Number(comment.id) !== Number(sourceInfo.root.id)) {
+        comments.push(comment);
+      }
+    }
+    comments.sort((a,b) => Number(a.id)-Number(b.id));
   } catch (err) {
     console.error('读取历史评论失败', task.id, sourcePostId, err?.message || err);
     return;
   }
-
-  const comments = [...(result?.messages || [])]
-    .filter(m => Number(m?.id || 0) > 0 && Number(m.id) !== Number(sourceInfo.root.id))
-    .sort((a,b) => Number(a.id)-Number(b.id));
 
   for (const comment of comments) {
     const [exists] = await p.query('SELECT target_message_id FROM telegram_discussion_message_maps WHERE task_id=? AND source_chat_id=? AND source_message_id=? LIMIT 1',
