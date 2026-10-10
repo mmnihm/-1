@@ -1559,7 +1559,7 @@ bot.action(/^syncset_(\d+)_repair_comments$/, async ctx => {
   const taskId = Number(ctx.match[1]);
   const uid = Number(ctx.from.id);
 
-  // Answer Telegram's callback before any database/network work; callback queries expire quickly.
+  // Acknowledge the callback before database/network work.
   try {
     await ctx.answerCbQuery('已收到');
   } catch (err) {
@@ -1582,21 +1582,35 @@ bot.action(/^syncset_(\d+)_repair_comments$/, async ctx => {
     }
 
     discussionRepairJobs.add(taskId);
-    await ctx.reply(\`🛠 已开始补齐任务 #\${taskId} 的历史评论区。\\n\\n会逐条检查已转发的频道帖子，并尝试补齐评论映射和遗漏评论。任务可能需要一些时间，请保持机器人运行。\`);
+    await ctx.reply(
+      '🛠 已开始补齐任务 #' + taskId + ' 的历史评论区。\n\n' +
+      '会逐条检查已转发的频道帖子，并尝试补齐评论映射和遗漏评论。任务可能需要一些时间，请保持机器人运行。'
+    );
     repairDiscussionMapsForTask(rows[0], uid)
       .then(async result => {
-        await bot.telegram.sendMessage(uid, \`✅ 任务 #\${taskId} 评论区补齐检查完成。\\n已检查帖子：\${result.checked}/\${result.total}\\n处理异常：\${result.errors}\\n\\n没有可访问评论区或目标频道未关联讨论群的帖子会自动跳过。\`);
+        await bot.telegram.sendMessage(
+          uid,
+          '✅ 任务 #' + taskId + ' 评论区补齐检查完成。\n' +
+          '已检查帖子：' + result.checked + '/' + result.total + '\n' +
+          '处理异常：' + result.errors + '\n\n' +
+          '没有可访问评论区或目标频道未关联讨论群的帖子会自动跳过。'
+        );
       })
       .catch(async err => {
         console.error('历史评论区补齐任务失败', taskId, err?.message || err);
-        try { await bot.telegram.sendMessage(uid, \`❌ 任务 #\${taskId} 评论区补齐失败：\${err?.message || err}\`); } catch {}
+        try {
+          await bot.telegram.sendMessage(uid, '❌ 任务 #' + taskId + ' 评论区补齐失败：' + (err?.message || err));
+        } catch {}
       })
       .finally(() => discussionRepairJobs.delete(taskId));
   } catch (err) {
     console.error('处理评论区补齐按钮失败', taskId, err?.message || err);
-    try { await ctx.reply(\`❌ 无法启动评论区补齐：\${err?.message || err}\`); } catch {}
+    try {
+      await ctx.reply('❌ 无法启动评论区补齐：' + (err?.message || err));
+    } catch {}
   }
 });
+
 bot.action(/^syncset_(\d+)_(topics|comments)$/, async ctx => {
   const taskId = Number(ctx.match[1]);
   const kind = ctx.match[2];
