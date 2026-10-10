@@ -2,6 +2,7 @@ import 'dotenv/config';
 import mysql from 'mysql2/promise';
 import { Telegraf, Markup } from 'telegraf';
 import { TelegramClient, Api } from 'telegram';
+import { CustomFile } from 'telegram/client/uploads.js';
 import { StringSession } from 'telegram/sessions/index.js';
 import { NewMessage } from 'telegram/events/index.js';
 import QRCode from 'qrcode';
@@ -489,6 +490,36 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function inferUploadFilename(message) {
+  const media = message?.media;
+  if (media?.className === 'MessageMediaPhoto') return 'photo.jpg';
+  const document = media?.document;
+  const attrs = document?.attributes || [];
+  for (const attr of attrs) {
+    const name = String(attr?.fileName || attr?.file_name || '').trim();
+    if (attr?.className === 'DocumentAttributeFilename' && name) return name;
+  }
+  if (attrs.some(attr => attr?.className === 'DocumentAttributeVideo' || attr?.className === 'DocumentAttributeRoundMessage')) return 'video.mp4';
+  if (attrs.some(attr => attr?.className === 'DocumentAttributeAudio')) {
+    const audio = attrs.find(attr => attr?.className === 'DocumentAttributeAudio');
+    return audio?.voice ? 'voice.ogg' : 'audio.mp3';
+  }
+  if (attrs.some(attr => attr?.className === 'DocumentAttributeAnimated')) return 'animation.gif';
+  if (attrs.some(attr => attr?.className === 'DocumentAttributeSticker')) return 'sticker.webp';
+  const mime = String(document?.mimeType || document?.mime_type || '').toLowerCase();
+  if (mime === 'image/jpeg') return 'image.jpg';
+  if (mime === 'image/png') return 'image.png';
+  if (mime === 'image/webp') return 'image.webp';
+  if (mime === 'video/mp4') return 'video.mp4';
+  if (mime.startsWith('audio/')) return mime === 'audio/ogg' ? 'audio.ogg' : 'audio.mp3';
+  return 'file.bin';
+}
+
+function makeUploadFile(message, buffer) {
+  const data = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+  return new CustomFile(inferUploadFilename(message), data.length, '', data);
+}
+
 async function sendTelegramMessagesWithoutSource(client, target, messages, topicResolver = null, replyResolver = null, filters = null) {
   const list = [...messages].filter(Boolean).map(msg => applyContentFiltersToMessage(msg, filters)).filter(Boolean);
   if (!list.length) return [];
@@ -514,7 +545,7 @@ async function sendTelegramMessagesWithoutSource(client, target, messages, topic
     if (msg.media) {
       const buffer = await client.downloadMedia(msg, {});
       if (!buffer) throw new Error('下载源媒体失败，源消息 ID=' + msg.id);
-      return client.sendFile(target, { file: buffer, ...(text ? { caption: text } : {}), ...reply });
+      return client.sendFile(target, { file: makeUploadFile(msg, buffer), ...(text ? { caption: text } : {}), forceDocument: false, ...reply });
     }
     if (!text) throw new Error('源消息没有可发送的文本或媒体，源消息 ID=' + msg.id);
     return client.sendMessage(target, { message: text, ...reply });
@@ -542,10 +573,10 @@ async function sendTelegramMessagesWithoutSource(client, target, messages, topic
       for (const msg of media) {
         const buffer = await client.downloadMedia(msg, {});
         if (!buffer) throw new Error('下载相册媒体失败，源消息 ID=' + msg.id);
-        files.push(buffer);
+        files.push(makeUploadFile(msg, buffer));
       }
       const captions = media.map(msg => String(msg.message || ''));
-      const result = await client.sendFile(target, { file: files, caption: captions, ...replyOptions(topicId, replyId) });
+      const result = await client.sendFile(target, { file: files, caption: captions, forceDocument: false, ...replyOptions(topicId, replyId) });
       pushSent(media.map(msg => msg.id), result);
     } catch (albumErr) {
       console.error('相册整组发送失败，改为逐条发送并保留话题', albumErr?.message || albumErr);
@@ -633,8 +664,9 @@ async function sendDiscussionMessage(client, targetChat, message, replyTo=0) {
     const buffer = await client.downloadMedia(message, {});
     if (!buffer) throw firstErr;
     return await client.sendFile(targetChat, {
-      file: buffer,
+      file: makeUploadFile(message, buffer),
       caption: String(message.message || ''),
+      forceDocument: false,
       ...options
     });
   }
@@ -661,8 +693,9 @@ async function sendDiscussionAlbum(client, targetChat, comments, replyTo=0) {
         buffers.push(buffer);
       }
       const result = await client.sendFile(targetChat, {
-        file: buffers,
+        file: media.map((item, index) => makeUploadFile(item, buffers[index])),
         caption: media.map(item => String(item.message || '')),
+        forceDocument: false,
         ...options
       });
       return (Array.isArray(result) ? result : [result]).filter(Boolean);
@@ -678,8 +711,9 @@ async function sendDiscussionAlbum(client, targetChat, comments, replyTo=0) {
             const buffer = await client.downloadMedia(item, {});
             if (!buffer) throw sendErr;
             result = await client.sendFile(targetChat, {
-              file: buffer,
+              file: makeUploadFile(item, buffer),
               caption: String(item.message || ''),
+              forceDocument: false,
               ...options
             });
           }
