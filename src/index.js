@@ -437,55 +437,46 @@ function sleep(ms) {
 async function sendTelegramMessagesWithoutSource(client, target, messages, topicResolver = null, replyResolver = null, filters = null) {
   const list = [...messages].filter(Boolean).map(msg => applyContentFiltersToMessage(msg, filters)).filter(Boolean);
   if (!list.length) return [];
-
   const sent = [];
   const albums = new Map();
   const pushSent = (sourceIds, result) => {
     const results = Array.isArray(result) ? result.filter(Boolean) : [result].filter(Boolean);
     const ids = Array.isArray(sourceIds) ? sourceIds : [sourceIds];
-    results.forEach((item, index) => {
-      sent.push({ sourceId: Number(ids[index] || ids[0] || 0), sent: item });
-    });
+    results.forEach((item, index) => sent.push({ sourceId: Number(ids[index] || ids[0] || 0), sent: item }));
   };
-  const sendOne = async (msg, replyTo) => {
+  const replyOptions = (topicId, replyId) => {
+    const topic = Number(topicId || 0);
+    const messageId = Number(replyId > 0 ? replyId : topic);
+    if (messageId <= 0) return {};
+    return { replyTo: topic > 0 ? new Api.InputReplyToMessage({ replyToMsgId: messageId, topMsgId: topic }) : messageId };
+  };
+  const sendOne = async (msg, topicId, replyId) => {
     const text = String(msg.message || '');
-    const formatting = Array.isArray(msg.entities) && msg.entities.length
-      ? { formattingEntities: msg.entities }
-      : {};
+    const reply = replyOptions(topicId, replyId);
     if (msg.media) {
       const buffer = await client.downloadMedia(msg, {});
       if (!buffer) throw new Error('下载源媒体失败，源消息 ID=' + msg.id);
-      return client.sendFile(target, {
-        file: buffer,
-        ...(text ? { caption: text, ...formatting } : {}),
-        ...(replyTo > 0 ? { replyTo } : {})
-      });
+      return client.sendFile(target, { file: buffer, ...(text ? { caption: text } : {}), ...reply });
     }
     if (!text) throw new Error('源消息没有可发送的文本或媒体，源消息 ID=' + msg.id);
-    return client.sendMessage(target, {
-      message: text,
-      ...formatting,
-      ...(replyTo > 0 ? { replyTo } : {})
-    });
+    return client.sendMessage(target, { message: text, ...reply });
   };
-
   for (const msg of list) {
     const topicId = topicResolver ? await topicResolver(msg) : 0;
     const replyId = replyResolver ? await replyResolver(msg, topicId) : 0;
-    const replyTo = replyId > 0 ? replyId : topicId;
     if (msg.groupedId != null && msg.media) {
-      const key = `${String(msg.groupedId)}:${topicId}:${replyTo}`;
+      const key = `${String(msg.groupedId)}:${topicId}:${replyId}`;
       if (!albums.has(key)) albums.set(key, []);
-      albums.get(key).push({ msg, topicId, replyTo });
+      albums.get(key).push({ msg, topicId, replyId });
     } else {
-      const result = await sendOne(msg, replyTo);
+      const result = await sendOne(msg, topicId, replyId);
       pushSent(msg.id, result);
     }
   }
-
   for (const group of albums.values()) {
     group.sort((a, b) => Number(a.msg.id) - Number(b.msg.id));
-    const replyTo = Number(group[0]?.replyTo || 0);
+    const topicId = Number(group[0]?.topicId || 0);
+    const replyId = Number(group[0]?.replyId || 0);
     const media = group.map(item => item.msg).filter(msg => msg.media);
     if (!media.length) continue;
     try {
@@ -496,20 +487,12 @@ async function sendTelegramMessagesWithoutSource(client, target, messages, topic
         files.push(buffer);
       }
       const captions = media.map(msg => String(msg.message || ''));
-      const captionEntities = media.map(msg =>
-        Array.isArray(msg.entities) && msg.entities.length ? msg.entities : []
-      );
-      const result = await client.sendFile(target, {
-        file: files,
-        caption: captions,
-        formattingEntities: captionEntities,
-        ...(replyTo > 0 ? { replyTo } : {})
-      });
+      const result = await client.sendFile(target, { file: files, caption: captions, ...replyOptions(topicId, replyId) });
       pushSent(media.map(msg => msg.id), result);
     } catch (albumErr) {
       console.error('相册整组发送失败，改为逐条发送并保留话题', albumErr?.message || albumErr);
       for (const msg of media) {
-        const result = await sendOne(msg, replyTo);
+        const result = await sendOne(msg, topicId, replyId);
         pushSent(msg.id, result);
       }
     }
