@@ -255,10 +255,32 @@ async function attachTelegramEvents(client, ownerId) {
       for(const task of tasks){
         if(Number(task.target_chat_id)===sourceChatId)continue;
         const filters=parseFilters(task.filters_json);
-        if(message.groupedId==null && !shouldForwardMessage(message,filters))continue;
-        // Grouped media is handled by GramJS's Album event below. Do not
-        // process each NewMessage update independently, or the album races itself.
-        if(message.groupedId!=null)continue;
+        if (message.groupedId != null) {
+          // Reliable fallback: queue every individual update by task + chat + groupedId.
+          // The Album event normally sends the whole set; this queue covers missed/partial
+          // Album events and refetches nearby source messages before sending.
+          const albumKey = `mt-album:${task.id}:${sourceChatId}:${String(message.groupedId)}`;
+          let queue = albumQueues.get(albumKey);
+          if (!queue) {
+            queue = {
+              task,
+              ownerId: uid,
+              sourceChatId,
+              ids: new Set(),
+              timer: null
+            };
+            albumQueues.set(albumKey, queue);
+          }
+          queue.ids.add(Number(message.id));
+          if (queue.timer) clearTimeout(queue.timer);
+          queue.timer = setTimeout(() => {
+            forwardTelegramAlbum(albumKey).catch(err =>
+              console.error('MTProto 相册兜底转发失败', task.id, message.groupedId, err?.message || err)
+            );
+          }, 1400);
+          continue;
+        }
+        if (!shouldForwardMessage(message, filters)) continue;
         await forwardTelegramMessages(task,sourceChatId,[Number(message.id)],uid);
       }
     }catch(err){console.error('MTProto 新消息处理失败',err?.message||err);}
@@ -2795,7 +2817,7 @@ async function handleRealtimeMessage(ctx, message, chatId) {
         } catch (err) {
           console.error('Bot API 相册整组复制失败（未拆分发送）', queue.task.id, ids.join(','), err?.message || err);
         }
-      }, 2200);
+      }, 4500);
       continue;
     }
 
