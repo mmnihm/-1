@@ -440,98 +440,78 @@ async function sendTelegramMessagesWithoutSource(client, target, messages, topic
 
   const sent = [];
   const albums = new Map();
-  const pushSent = (sourceId, result) => {
-    if (Array.isArray(result)) {
-      result.filter(Boolean).forEach((item, index) => {
-        sent.push({ sourceId: Number(sourceId[index] || sourceId), sent: item });
+  const pushSent = (sourceIds, result) => {
+    const results = Array.isArray(result) ? result.filter(Boolean) : [result].filter(Boolean);
+    const ids = Array.isArray(sourceIds) ? sourceIds : [sourceIds];
+    results.forEach((item, index) => {
+      sent.push({ sourceId: Number(ids[index] || ids[0] || 0), sent: item });
+    });
+  };
+  const sendOne = async (msg, replyTo) => {
+    const text = String(msg.message || '');
+    const formatting = Array.isArray(msg.entities) && msg.entities.length
+      ? { formattingEntities: msg.entities }
+      : {};
+    if (msg.media) {
+      const buffer = await client.downloadMedia(msg, {});
+      if (!buffer) throw new Error('下载源媒体失败，源消息 ID=' + msg.id);
+      return client.sendFile(target, {
+        file: buffer,
+        ...(text ? { caption: text, ...formatting } : {}),
+        ...(replyTo > 0 ? { replyTo } : {})
       });
-      return;
     }
-    sent.push({ sourceId: Number(sourceId), sent: result });
+    if (!text) throw new Error('源消息没有可发送的文本或媒体，源消息 ID=' + msg.id);
+    return client.sendMessage(target, {
+      message: text,
+      ...formatting,
+      ...(replyTo > 0 ? { replyTo } : {})
+    });
   };
 
   for (const msg of list) {
     const topicId = topicResolver ? await topicResolver(msg) : 0;
     const replyId = replyResolver ? await replyResolver(msg, topicId) : 0;
     const replyTo = replyId > 0 ? replyId : topicId;
-    if (msg.groupedId != null) {
+    if (msg.groupedId != null && msg.media) {
       const key = `${String(msg.groupedId)}:${topicId}:${replyTo}`;
       if (!albums.has(key)) albums.set(key, []);
       albums.get(key).push({ msg, topicId, replyTo });
     } else {
-      try {
-        pushSent(msg.id, await client.sendMessage(target, {
-          message: msg,
-          ...(replyTo > 0 ? { replyTo } : {})
-        }));
-      } catch (firstErr) {
-        if (!msg.media) throw firstErr;
-        const buffer = await client.downloadMedia(msg, {});
-        if (!buffer) throw firstErr;
-        pushSent(msg.id, await client.sendFile(target, {
-          file: buffer,
-          caption: String(msg.message || ''),
-          ...(replyTo > 0 ? { replyTo } : {})
-        }));
-      }
+      const result = await sendOne(msg, replyTo);
+      pushSent(msg.id, result);
     }
   }
 
   for (const group of albums.values()) {
     group.sort((a, b) => Number(a.msg.id) - Number(b.msg.id));
-    const topicId = Number(group[0]?.topicId || 0);
     const replyTo = Number(group[0]?.replyTo || 0);
     const media = group.map(item => item.msg).filter(msg => msg.media);
-    if (media.length > 1) {
-      try {
-        const result = await client.sendFile(target, {
-          file: media.map(msg => msg.media),
-          caption: media.map(msg => String(msg.message || '')),
-          ...(replyTo > 0 ? { replyTo } : {})
-        });
-        const arr = Array.isArray(result) ? result : [result];
-        pushSent(media.map(item => item.id), arr);
-      } catch (albumErr) {
-        console.error('相册原媒体发送失败，改用逐条复制', albumErr?.message || albumErr);
-        for (const item of media) {
-          try {
-            pushSent(item.id, await client.sendMessage(target, {
-              message: item,
-              ...(replyTo > 0 ? { replyTo } : {})
-            }));
-          } catch (itemErr) {
-            if (!item.media) throw itemErr;
-            const buffer = await client.downloadMedia(item, {});
-            if (!buffer) throw itemErr;
-            pushSent(item.id, await client.sendFile(target, {
-              file: buffer,
-              caption: String(item.message || ''),
-              ...(replyTo > 0 ? { replyTo } : {})
-            }));
-          }
-        }
+    if (!media.length) continue;
+    try {
+      const files = [];
+      for (const msg of media) {
+        const buffer = await client.downloadMedia(msg, {});
+        if (!buffer) throw new Error('下载相册媒体失败，源消息 ID=' + msg.id);
+        files.push(buffer);
       }
-    } else if (media.length === 1) {
-      const item = media[0];
-      try {
-        pushSent(item.id, await client.sendMessage(target, {
-          message: item,
-          ...(replyTo > 0 ? { replyTo } : {})
-        }));
-      } catch (firstErr) {
-        const buffer = await client.downloadMedia(item, {});
-        if (!buffer) throw firstErr;
-        pushSent(item.id, await client.sendFile(target, {
-          file: buffer,
-          caption: String(item.message || ''),
-          ...(replyTo > 0 ? { replyTo } : {})
-        }));
-      }
-    } else if (group[0]?.msg) {
-      pushSent(group[0].msg.id, await client.sendMessage(target, {
-        message: group[0].msg,
+      const captions = media.map(msg => String(msg.message || ''));
+      const captionEntities = media.map(msg =>
+        Array.isArray(msg.entities) && msg.entities.length ? msg.entities : []
+      );
+      const result = await client.sendFile(target, {
+        file: files,
+        caption: captions,
+        formattingEntities: captionEntities,
         ...(replyTo > 0 ? { replyTo } : {})
-      }));
+      });
+      pushSent(media.map(msg => msg.id), result);
+    } catch (albumErr) {
+      console.error('相册整组发送失败，改为逐条发送并保留话题', albumErr?.message || albumErr);
+      for (const msg of media) {
+        const result = await sendOne(msg, replyTo);
+        pushSent(msg.id, result);
+      }
     }
   }
   return sent;
