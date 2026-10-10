@@ -598,55 +598,80 @@ async function reserveForwardSlot(adminId, messageCount) {
 }
 
 async function sendTelegramMessagesWithoutSource(client, source, target, messages, topicResolver = null, replyResolver = null, filters = null, rateAdminId = 0) {
-  // Native forwarding preserves Telegram album grouping and avoids downloading/re-uploading media.
+  // Native forwarding keeps Telegram's original album/media. Use the low-level
+  // API because GramJS's forwardMessages helper does not expose topMsgId.
   const list = [...messages].filter(Boolean);
   if (!list.length) return [];
   const sent = [];
-  const pushSent = (sourceIds, result) => {
-    const results = Array.isArray(result) ? result.filter(Boolean) : [result].filter(Boolean);
-    const ids = Array.isArray(sourceIds) ? sourceIds : [sourceIds];
-    results.forEach((item, index) => sent.push({ sourceId: Number(ids[index] || ids[0] || 0), sent: item }));
-  };
-  const replyOptions = (topicId, replyId) => {
-    const topic = Number(topicId || 0);
-    const messageId = Number(replyId > 0 ? replyId : topic);
-    return messageId > 0 ? { replyTo: messageId } : {};
-  };
-
-  // Collect whole albums before applying filters. If any member passes, forward
-  // the complete album in one request; never forward its members as separate files.
   const albumGroups = new Map();
   for (const msg of list) {
     const albumKey = msg.groupedId != null ? 'album:' + String(msg.groupedId) : 'single:' + Number(msg.id);
     if (!albumGroups.has(albumKey)) albumGroups.set(albumKey, []);
     albumGroups.get(albumKey).push(msg);
   }
-  const groups = new Map();
+
   for (const album of albumGroups.values()) {
     const items = album.sort((a, b) => Number(a.id) - Number(b.id));
     if (!items.some(item => shouldForwardMessage(item, filters))) continue;
     const first = items[0];
     const topicId = topicResolver ? Number(await topicResolver(first) || 0) : 0;
     const replyId = replyResolver ? Number(await replyResolver(first, topicId) || 0) : 0;
-    const key = String(first.groupedId != null ? first.groupedId : 'single:' + Number(first.id)) + ':' + topicId + ':' + replyId;
-    if (!groups.has(key)) groups.set(key, { topicId, replyId, messages: [] });
-    groups.get(key).messages.push(...items);
-  }
-
-  for (const group of groups.values()) {
-    const items = group.messages.sort((a, b) => Number(a.id) - Number(b.id));
-    if (!items.length) continue;
-    // Count media items/messages, not just API calls. Albums still travel together.
     await reserveForwardSlot(rateAdminId, items.length);
-    const reply = replyOptions(group.topicId, group.replyId);
+
+    const sourcePeer = await client.getInputEntity(source);
+    const targetPeer = await client.getInputEntity(target);
     const ids = items.map(item => Number(item.id));
-    const result = await client.forwardMessages(target, {
-      messages: ids,
-      fromPeer: source,
-      dropAuthor: false,
-      ...reply
-    });
-    pushSent(ids, result);
+    const requestArgs = {
+      fromPeer: sourcePeer,
+      id: ids,
+      toPeer: targetPeer,
+      randomId: ids.map((id, index) => BigInt(Date.now()) * 100000n + BigInt(Math.abs(id) * 10 + index + 1)),
+      dropAuthor: false
+    };
+    // For forum groups, topMsgId is the actual target topic ID. replyTo in
+    // GramJS's high-level helper is ignored by forwardMessages, causing General-topic posts.
+    if (topicId > 1) requestArgs.topMsgId = topicId;
+    else if (replyId > 0) requestArgs.topMsgId = replyId;
+
+    const request = new Api.messages.ForwardMessages(requestArgs);
+    const result = await client.invoke(request);
+    const updateMessages = (Array.isArray(result?.updates) ? result.updates : [])
+      .map(update => update?.message || update?.msg || null)
+      .filter(message => message && Number(message.id) > 0)
+      .sort((a, b) => Number(a.id) - Number(b.id));
+
+    let targetMessages = updateMessages;
+    if (updateMessages.length) {
+      try {
+        const refreshed = await client.getMessages(target, { ids: updateMessages.map(message => Number(message.id)) });
+        const byId = new Map((Array.isArray(refreshed) ? refreshed : [refreshed]).filter(Boolean).map(message => [Number(message.id), message]));
+        targetMessages = updateMessages.map(message => byId.get(Number(message.id)) || message);
+      } catch (refreshError) {
+        console.warn('读取刚转发的目标消息失败，使用 Telegram 更新返回值', refreshError?.message || refreshError);
+      }
+    }
+
+    for (let index = 0; index < items.length; index++) {
+      const sourceMessage = items[index];
+      const targetMessage = targetMessages[index];
+      if (!targetMessage) continue;
+      sent.push({ sourceId: Number(sourceMessage.id), sent: targetMessage });
+
+      // Native forwarding preserves the source; apply remove/replace keyword and
+      // link rules by editing the newly forwarded message afterwards.
+      const originalText = String(sourceMessage.message || '');
+      if (originalText && filters && targetMessage.id) {
+        const filteredText = applyContentFiltersToText(originalText, filters);
+        if (filteredText !== null && filteredText !== originalText) {
+          try {
+            await client.editMessage(target, { message: Number(targetMessage.id), text: filteredText, linkPreview: false });
+            targetMessage.message = filteredText;
+          } catch (editError) {
+            console.error('转发后编辑关键词/链接失败', sourceMessage.id, targetMessage.id, editError?.message || editError);
+          }
+        }
+      }
+    }
   }
   return sent;
 }
