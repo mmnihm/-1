@@ -286,8 +286,8 @@ async function attachTelegramEvents(client, ownerId) {
     }catch(err){console.error('MTProto 新消息处理失败',err?.message||err);}
   },new NewMessage({}));
 
-  // GramJS emits one Album event containing the complete grouped media set.
-  // This is more reliable than collecting separate NewMessage updates with a timer.
+  // GramJS Album and NewMessage updates feed the same bounded queue.
+  // This prevents both handlers racing to forward the same album separately.
   client.addEventHandler(async event => {
     try {
       const messages = Array.isArray(event?.messages) ? event.messages.filter(Boolean) : [];
@@ -304,12 +304,25 @@ async function attachTelegramEvents(client, ownerId) {
       );
       const ids = [...new Set(messages.map(message => Number(message?.id)).filter(Boolean))].sort((a,b) => a-b);
       if (ids.length < 2) return;
-      console.log('GramJS Album 事件收到完整相册', '源频道', sourceChatId, '消息ID', ids.join(','));
+      console.log('GramJS Album 事件收到完整相册，合并进入队列', '源频道', sourceChatId, '消息ID', ids.join(','));
       for (const task of tasks) {
         if (Number(task.target_chat_id) === sourceChatId) continue;
         const filters = parseFilters(task.filters_json);
         if (!messages.some(message => shouldForwardMessage(message, filters))) continue;
-        await forwardTelegramMessages(task, sourceChatId, ids, uid);
+        const groupedId = String(first.groupedId ?? messages.find(message => message.groupedId != null)?.groupedId ?? ids[0]);
+        const albumKey = `mt-album:${task.id}:${sourceChatId}:${groupedId}`;
+        let queue = albumQueues.get(albumKey);
+        if (!queue) {
+          queue = { task, ownerId: uid, sourceChatId, ids: new Set(), timer: null };
+          albumQueues.set(albumKey, queue);
+        }
+        for (const id of ids) queue.ids.add(id);
+        if (queue.timer) clearTimeout(queue.timer);
+        queue.timer = setTimeout(() => {
+          forwardTelegramAlbum(albumKey).catch(err =>
+            console.error('MTProto 相册队列转发失败', task.id, groupedId, err?.message || err)
+          );
+        }, 1400);
       }
     } catch (err) {
       console.error('GramJS Album 事件处理失败', err?.message || err);
