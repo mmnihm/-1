@@ -634,8 +634,9 @@ async function reserveForwardSlot(adminId, messageCount) {
 }
 
 async function sendTelegramMessagesWithoutSource(client, source, target, messages, topicResolver = null, replyResolver = null, filters = null, rateAdminId = 0) {
-  // Native forwarding keeps Telegram's original album/media. Use the low-level
-  // API because GramJS's forwardMessages helper does not expose topMsgId.
+  // Telegram's MTProto forwardMessages API may split grouped media into separate posts.
+  // For real albums, resend all media together with sendFile(file: [...]) so Telegram
+  // creates one album, without a "Forwarded from" header.
   const list = [...messages].filter(Boolean);
   if (!list.length) return [];
   const sent = [];
@@ -654,6 +655,51 @@ async function sendTelegramMessagesWithoutSource(client, source, target, message
     const replyId = replyResolver ? Number(await replyResolver(first, topicId) || 0) : 0;
     await reserveForwardSlot(rateAdminId, items.length);
 
+    // Only true multi-message media albums are copied via one sendFile call.
+    // Single messages and non-media messages retain the native forwarding path.
+    if (items.length > 1 && items.every(item => item.media)) {
+      const captions = items.map(item => {
+        const originalText = String(item.message || '');
+        const filteredText = applyContentFiltersToText(originalText, filters);
+        return filteredText == null ? '' : filteredText;
+      });
+      const options = {
+        file: items.map(item => item.media),
+        caption: captions,
+        forceDocument: false,
+        topMsgId: topicId > 0 ? topicId : undefined,
+        replyTo: replyId > 0 ? replyId : undefined
+      };
+      let results;
+      try {
+        const result = await client.sendFile(target, options);
+        results = Array.isArray(result) ? result.filter(Boolean) : (result ? [result] : []);
+      } catch (reuseError) {
+        // If Telegram rejects stale media references, download the whole album and
+        // retry as one grouped upload. Never fall back to one-message-at-a-time sends.
+        console.warn('直接复用媒体发送相册失败，尝试整组重新上传', items.map(item => item.id).join(','), reuseError?.message || reuseError);
+        const uploadFiles = [];
+        for (const item of items) {
+          const buffer = await client.downloadMedia(item, {});
+          if (!buffer) throw new Error('相册媒体下载失败，已停止整组发送，源消息ID=' + item.id);
+          uploadFiles.push(makeUploadFile(item, buffer));
+        }
+        const result = await client.sendFile(target, {
+          ...options,
+          file: uploadFiles
+        });
+        results = Array.isArray(result) ? result.filter(Boolean) : (result ? [result] : []);
+      }
+      if (results.length !== items.length) {
+        throw new Error('整组相册发送后返回消息数量不匹配：源=' + items.length + '，目标=' + results.length + '；为避免错误绑定资源，停止标记本组');
+      }
+      console.log('MTProto 相册已整组复制', items.map(item => item.id).join(','), '目标消息数', results.length);
+      for (let index = 0; index < items.length; index++) {
+        sent.push({ sourceId: Number(items[index].id), sent: results[index] });
+      }
+      continue;
+    }
+
     const sourcePeer = await client.getInputEntity(source);
     const targetPeer = await client.getInputEntity(target);
     const ids = items.map(item => Number(item.id));
@@ -664,10 +710,7 @@ async function sendTelegramMessagesWithoutSource(client, source, target, message
       randomId: ids.map((id, index) => BigInt(Date.now()) * 100000n + BigInt(Math.abs(id) * 10 + index + 1)),
       dropAuthor: true
     };
-    // For forum groups, topMsgId is the actual target topic ID. replyTo in
-    // GramJS's high-level helper is ignored by forwardMessages, causing General-topic posts.
     if (topicId > 0) requestArgs.topMsgId = topicId;
-
     const request = new Api.messages.ForwardMessages(requestArgs);
     const result = await client.invoke(request);
     const updateMessages = (Array.isArray(result?.updates) ? result.updates : [])
@@ -691,9 +734,6 @@ async function sendTelegramMessagesWithoutSource(client, source, target, message
       const targetMessage = targetMessages[index];
       if (!targetMessage) continue;
       sent.push({ sourceId: Number(sourceMessage.id), sent: targetMessage });
-
-      // Native forwarding preserves the source; apply remove/replace keyword and
-      // link rules by editing the newly forwarded message afterwards.
       const originalText = String(sourceMessage.message || '');
       if (originalText && filters && targetMessage.id) {
         const filteredText = applyContentFiltersToText(originalText, filters);
