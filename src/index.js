@@ -102,7 +102,9 @@ async function db() {
       'ALTER TABLE forward_tasks ADD COLUMN history_processed BIGINT DEFAULT 0',
       'ALTER TABLE forward_tasks ADD COLUMN history_skipped BIGINT DEFAULT 0',
       'ALTER TABLE forward_tasks ADD COLUMN history_failed BIGINT DEFAULT 0',
-      'ALTER TABLE forward_tasks ADD COLUMN filters_json TEXT NULL'
+      'ALTER TABLE forward_tasks ADD COLUMN filters_json TEXT NULL',
+      'ALTER TABLE forward_tasks ADD COLUMN history_start_date DATETIME NULL',
+      'ALTER TABLE forward_tasks ADD COLUMN history_end_date DATETIME NULL'
     ];
     for (const sql of migrations) {
       try { await pool.query(sql); }
@@ -1158,7 +1160,7 @@ function menu(userId) {
   return Markup.inlineKeyboard([
     [Markup.button.callback(loggedIn?'✅ Telegram账号已登录':'🔐 Telegram账号登录','tg_login')],
     [Markup.button.callback('➕ 添加任务','add_task')],
-    [Markup.button.callback('📚 全部历史克隆','history_all'),Markup.button.callback('🕘 按时间/消息范围克隆','set_history')],
+    [Markup.button.callback('📚 全部历史克隆','history_all'),Markup.button.callback('📅 按日期时间克隆','history_dates'),Markup.button.callback('🕘 按消息 ID 范围克隆','set_history')],
     [Markup.button.callback('▶️ 开始同步','start_sync'),Markup.button.callback('⏸ 暂停同步','pause_sync')],
     [Markup.button.callback('🔄 实时转发','realtime'),Markup.button.callback('⚙️ 同步设置','sync_settings')],
     [Markup.button.callback('🎛 过滤设置','filters'),Markup.button.callback('📊 任务进度','progress')],
@@ -1312,6 +1314,19 @@ async function syncTask(task) {
           if(!msg){
             await p.query('UPDATE forward_tasks SET history_processed=history_processed+1,history_skipped=history_skipped+1,history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
             continue;
+          }
+
+          // 日期范围模式：仅转发所选 UTC+8 日期时间内的消息。
+          const dateRange = task.history_start_date && task.history_end_date
+            ? { start: new Date(task.history_start_date), end: new Date(task.history_end_date) }
+            : null;
+          if (dateRange && msg.date) {
+            const messageDate = new Date(Number(msg.date) * 1000);
+            if (messageDate < dateRange.start || messageDate > dateRange.end) {
+              await p.query('UPDATE forward_tasks SET history_processed=history_processed+1,history_skipped=history_skipped+1,history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
+              await markForwarded(taskId,id,null);
+              continue;
+            }
           }
 
           if(!shouldForwardMessage(msg,filters)){
@@ -2038,6 +2053,35 @@ bot.action(/^history_all_task_(\\d+)$/, async ctx => {
   }
 });
 
+bot.action('history_dates', async ctx => {
+  const rows = await getTasks(ctx.from.id);
+  if (!rows.length) return ctx.answerCbQuery('没有任务');
+  await ctx.answerCbQuery();
+  return ctx.reply(
+    '📅 按日期时间克隆历史消息\n\n请选择任务：',
+    Markup.inlineKeyboard(rows.map(t => [
+      Markup.button.callback('#' + t.id + ' ' + t.source_chat_id + ' → ' + t.target_chat_id, 'history_dates_task_' + t.id)
+    ]))
+  );
+});
+
+bot.action(/^history_dates_task_(\\d+)$/, async ctx => {
+  const uid = Number(ctx.from.id);
+  const taskId = Number(ctx.match[1]);
+  if (!userClients.has(uid)) {
+    await ctx.answerCbQuery('请先登录 Telegram');
+    return ctx.reply('❌ 请先登录 Telegram 账号。', menu(uid));
+  }
+  const p = await db();
+  const [rows] = await p.query('SELECT id FROM forward_tasks WHERE id=? AND admin_id=?', [taskId, uid]);
+  if (!rows.length) return ctx.answerCbQuery('任务不存在');
+  sessions.set(uid, { step: 'history_date_start', taskId });
+  await ctx.answerCbQuery();
+  return ctx.reply(
+    '📅 设置日期时间范围\n\n请发送开始时间和结束时间，每行一个，使用 24 小时制：\n\n2026-10-01 00:00\n2026-10-10 23:59\n\n按服务器时间解释为 UTC+8。请确认结束时间晚于开始时间。'
+  );
+});
+
 bot.action('set_history', async ctx => {
   const rows = await getTasks(ctx.from.id);
   if (!rows.length) return ctx.answerCbQuery('没有任务');
@@ -2064,9 +2108,75 @@ bot.action(/^history_task_(\d+)$/, async ctx => {
 });
 
 
+async function processHistoryDateInput(ctx) {
+  const uid = Number(ctx.from.id);
+  const session = sessions.get(uid);
+  if (!session || session.step !== 'history_date_start') return false;
+  const lines = String(ctx.message?.text || '').trim().split(/\\r?\\n/).map(x => x.trim()).filter(Boolean);
+  const parseDate = value => {
+    const m = value.match(/^(\\d{4})-(\\d{2})-(\\d{2})[ T](\\d{2}):(\\d{2})(?::(\\d{2}))?$/);
+    if (!m) return null;
+    const [_, y, mo, d, h, mi, sec = '0'] = m;
+    const date = new Date(Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h) - 8, Number(mi), Number(sec)));
+    if (!Number.isFinite(date.getTime())) return null;
+    return date;
+  };
+  if (lines.length < 2) {
+    await ctx.reply('❌ 请发送两行时间：\\n2026-10-01 00:00\\n2026-10-10 23:59');
+    return true;
+  }
+  const startDate = parseDate(lines[0]);
+  const endDate = parseDate(lines[1]);
+  if (!startDate || !endDate || endDate <= startDate) {
+    await ctx.reply('❌ 时间格式不正确或结束时间早于开始时间。请使用 YYYY-MM-DD HH:mm，每行一个时间。');
+    return true;
+  }
+  const taskId = Number(session.taskId);
+  const p = await db();
+  const [tasks] = await p.query('SELECT * FROM forward_tasks WHERE id=? AND admin_id=?', [taskId, uid]);
+  if (!tasks.length) {
+    sessions.delete(uid);
+    await ctx.reply('❌ 找不到任务。', menu(uid));
+    return true;
+  }
+  try {
+    const client = userClients.get(uid);
+    const source = await client.getEntity(Number(tasks[0].source_chat_id));
+    // 找到起始日期之后的第一条消息，以及结束日期之前的最后一条消息。
+    // 先用 Telegram 的日期游标定位，再用消息时间二次过滤，避免跨界消息误转。
+    let firstId = 0;
+    for await (const msg of client.iterMessages(source, { reverse: true, offsetDate: startDate, limit: 1 })) {
+      if (msg && Number(msg.id) > 0) firstId = Number(msg.id);
+    }
+    const endResults = await client.getMessages(source, { limit: 1, offsetDate: new Date(endDate.getTime() + 1000) });
+    let lastId = Number((Array.isArray(endResults) ? endResults[0] : endResults)?.id || 0);
+    if (!firstId || !lastId || lastId < firstId) {
+      await ctx.reply('❌ 这个日期范围内没有找到消息，或账号无法读取该时间段。请检查日期并重试。', menu(uid));
+      return true;
+    }
+    await p.query(
+      'UPDATE forward_tasks SET history_next_id=?,history_end_id=?,history_total=?,history_start_date=?,history_end_date=?,history_processed=0,history_skipped=0,history_failed=0,history_done=0,status="paused" WHERE id=? AND admin_id=?',
+      [firstId, lastId, lastId - firstId + 1, startDate, endDate, taskId, uid]
+    );
+    sessions.delete(uid);
+    await ctx.reply(
+      '✅ 已设置日期时间范围\n任务：#' + taskId +
+      '\n开始：' + lines[0] + '\n结束：' + lines[1] +
+      '\n消息 ID 范围：' + firstId + ' → ' + lastId +
+      '\n\n注意：同步时还会按消息实际时间检查范围，避免转发时间段之外的消息。点击“▶️ 开始同步”启动。',
+      menu(uid)
+    );
+  } catch (err) {
+    console.error('设置日期历史范围失败', taskId, err?.message || err);
+    await ctx.reply('❌ 读取源频道时间范围失败：' + String(err?.message || err).slice(0, 250), menu(uid));
+  }
+  return true;
+}
+
 async function processHistoryInput(ctx) {
   const uid=Number(ctx.from.id);
   const session=sessions.get(uid);
+  if (session?.step === 'history_date_start') return processHistoryDateInput(ctx);
   if (!session || (session.step!=='history_start' && session.step!=='history_end')) return false;
 
   const forwardedId=extractHistoryMessageId(ctx.message);
