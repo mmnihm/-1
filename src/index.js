@@ -1549,14 +1549,14 @@ bot.command('menu',async ctx=>ctx.reply('🤖 主菜单',menu(ctx.from.id)));
 bot.action('tg_login',async ctx=>{
   const uid=Number(ctx.from.id);
   await ctx.answerCbQuery();
-  if(userClients.has(uid))return ctx.reply('✅ 你的 Telegram 账号已经登录。\\n\\n可以直接添加任务。',menu(uid));
+  if(userClients.has(uid))return ctx.reply('✅ 你的 Telegram 账号已经登录。\n\n可以直接添加任务。',menu(uid));
   const current=sessions.get(uid);
   if(current?.step?.startsWith('tg_'))return ctx.reply('⏳ Telegram 登录流程正在进行中，请按当前提示继续；如正在扫码，请扫描最新二维码。');
-  if(!TG_API_ID||!TG_API_HASH)return ctx.reply('❌ 服务器尚未配置 TG_API_ID / TG_API_HASH。\\n\\n普通用户不需要填写 API ID/API Hash，请管理员在 VPS 的 .env 中配置一次。');
-  return ctx.reply('🔐 选择 Telegram 登录方式\\n\\n📱 手机号验证码登录：输入手机号和 Telegram 验证码。\\n📷 扫码登录：用另一台已登录 Telegram 的设备扫描二维码并确认。',Markup.inlineKeyboard([
+  if(!TG_API_ID||!TG_API_HASH)return ctx.reply('❌ 服务器尚未配置 TG_API_ID / TG_API_HASH。\n\n普通用户不需要填写 API ID/API Hash，请管理员在 VPS 的 .env 中配置一次。');
+  return ctx.reply('🔐 选择 Telegram 登录方式\n\n📱 手机号验证码登录：输入手机号和 Telegram 验证码。\n📷 扫码登录：用另一台已登录 Telegram 的设备扫描二维码并确认。',Markup.inlineKeyboard([
     [Markup.button.callback('📱 手机号验证码登录','tg_login_phone')],
     [Markup.button.callback('📷 扫码登录','tg_login_qr')],
-    [Markup.button.callback('↩️ 返回主菜单','menu')]
+    [Markup.button.callback('↩️ 返回登录方式','tg_login')]
   ]));
 });
 
@@ -1568,7 +1568,7 @@ bot.action('tg_login_phone',async ctx=>{
   if(current?.step?.startsWith('tg_'))return ctx.reply('⏳ 已有 Telegram 登录流程正在进行，请先完成当前流程。');
   if(!TG_API_ID||!TG_API_HASH)return ctx.reply('❌ 服务器尚未配置 TG_API_ID / TG_API_HASH。');
   sessions.set(uid,{step:'tg_phone'});
-  return ctx.reply('📱 手机号验证码登录\\n\\n请输入 Telegram 手机号（含国家区号，例如 +8613812345678）。');
+  return ctx.reply('📱 手机号验证码登录\n\n请输入 Telegram 手机号（含国家区号，例如 +8613812345678）。');
 });
 
 bot.action('tg_login_qr',async ctx=>{
@@ -1583,9 +1583,9 @@ bot.action('tg_login_qr',async ctx=>{
     console.error('用户 Telegram 扫码登录失败',uid,err?.message||err);
     const active=sessions.get(uid);
     if(active?.step?.startsWith('tg_'))sessions.delete(uid);
-    bot.telegram.sendMessage(uid,'❌ Telegram 扫码登录失败：'+(err?.message||err)+'\\n\\n请重新点击“🔐 Telegram账号登录”再试。',menu(uid)).catch(()=>{});
+    bot.telegram.sendMessage(uid,'❌ Telegram 扫码登录失败：'+(err?.message||err)+'\n\n请重新点击“🔐 Telegram账号登录”再试。',menu(uid)).catch(()=>{});
   });
-  return ctx.reply('📷 正在生成 Telegram 登录二维码……\\n\\n请使用另一台已经登录 Telegram 的手机/电脑，在 Telegram 设置中的“设备”里选择“连接桌面设备”并扫描机器人发来的最新二维码。二维码会过期，请及时扫描。');
+  return ctx.reply('📷 正在生成 Telegram 登录二维码……\n\n请使用另一台已经登录 Telegram 的手机/电脑，在 Telegram 设置中的“设备”里选择“连接桌面设备”并扫描机器人发来的最新二维码。二维码会过期，请及时扫描。');
 });
 bot.action('tg_logout',async ctx=>{
   const uid=Number(ctx.from.id),p=await db();
@@ -2271,21 +2271,21 @@ async function runTelegramQrLogin(userId){
       await attachTelegramEvents(client,uid);
       userClients.set(uid,client);
       sessions.delete(uid);
-      return bot.telegram.sendMessage(uid,'✅ Telegram账号登录成功！\\n\\n以后你的任务都会使用这个 Telegram 账号执行，VPS 重启后会自动恢复登录状态。',menu(uid));
+      return bot.telegram.sendMessage(uid,'✅ Telegram账号登录成功！\n\n以后你的任务都会使用这个 Telegram 账号执行，VPS 重启后会自动恢复登录状态。',menu(uid));
     }
-    await bot.telegram.sendMessage(uid,'📷 请扫描下方二维码登录。\\n\\n只扫描你自己发起的登录二维码；请勿把二维码转发给他人。若出现多张二维码，请扫描最新一张。');
+    await bot.telegram.sendMessage(uid,'📷 请扫描下方二维码登录。\n\n只扫描你自己发起的登录二维码；请勿把二维码转发给他人。若出现多张二维码，请扫描最新一张。');
     await client.signInUserWithQrCode({apiId:Number(TG_API_ID),apiHash:TG_API_HASH},{
       qrCode:async({token,expires})=>{
         const current=sessions.get(uid);
         if(!current||!current.step?.startsWith('tg_'))throw new Error('扫码登录已取消');
         const deepLink='tg://login?token='+Buffer.from(token).toString('base64url');
         const imageBuffer=await QRCode.toBuffer(deepLink,{type:'png',width:360,margin:2,errorCorrectionLevel:'M'});
-        await bot.telegram.sendPhoto(uid,{source:imageBuffer,filename:'telegram-login-qr.png'},{caption:'📷 Telegram 扫码登录\\n\\n请在二维码有效期内，用另一台已登录 Telegram 的设备扫描并确认。\\n过期后请扫描后续发来的最新二维码。'});
+        await bot.telegram.sendPhoto(uid,{source:imageBuffer,filename:'telegram-login-qr.png'},{caption:'📷 Telegram 扫码登录\n\n请在二维码有效期内，用另一台已登录 Telegram 的设备扫描并确认。\n过期后请扫描后续发来的最新二维码。'});
         console.log('Telegram 扫码二维码已生成',uid,'expires',expires);
       },
       password:async(hint)=>{
         let prompt='🔐 此 Telegram 账号启用了两步验证。请输入两步验证密码。';
-        if(hint)prompt+='\\n密码提示：'+hint;
+        if(hint)prompt+='\n密码提示：'+hint;
         const password=await waitTelegramInput(uid,'tg_password','passwordResolve',prompt);
         return String(password);
       },
@@ -2302,7 +2302,7 @@ async function runTelegramQrLogin(userId){
     userClients.set(uid,client);
     sessions.delete(uid);
     console.log('Telegram 扫码登录成功',uid);
-    return bot.telegram.sendMessage(uid,'✅ Telegram账号扫码登录成功！\\n\\n以后你的任务都会使用这个 Telegram 账号执行，VPS 重启后会自动恢复登录状态。',menu(uid));
+    return bot.telegram.sendMessage(uid,'✅ Telegram账号扫码登录成功！\n\n以后你的任务都会使用这个 Telegram 账号执行，VPS 重启后会自动恢复登录状态。',menu(uid));
   }catch(err){
     try{await client.disconnect();}catch{}
     throw err;
