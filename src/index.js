@@ -398,11 +398,52 @@ async function ensureTargetForumTopic(client, task, sourceEntity, targetEntity, 
       result = await client.invoke(new Api.channels.CreateForumTopic(args));
     }
 
-    const created = result?.updates?.find(update =>
-      update?.action?.className === 'MessageActionTopicCreate'
-    );
-    const targetId = Number(created?.message?.id || created?.id || 0);
-    if (!targetId) throw new Error('创建目标话题后未获取到话题 ID');
+    // GramJS 的 CreateForumTopic 返回 Updates 时，话题创建动作通常位于
+    // update.message.action，而不是 update.action；兼容不同 Updates 返回结构。
+    const updates = Array.isArray(result?.updates) ? result.updates : [];
+    const createdUpdate = updates.find(update => {
+      const message = update?.message || update?.msg || null;
+      const action = message?.action || update?.action || null;
+      return action?.className === 'MessageActionTopicCreate' ||
+        action?.constructor?.name === 'MessageActionTopicCreate';
+    });
+    const createdMessage = createdUpdate?.message || createdUpdate?.msg || null;
+    let targetId = Number(createdMessage?.id || createdUpdate?.id || 0);
+
+    // 兜底：部分 GramJS 版本返回的更新对象结构不同，按创建动作再次扫描。
+    if (!targetId) {
+      for (const update of updates) {
+        const candidates = [update?.message, update?.msg, update?.message?.message].filter(Boolean);
+        for (const candidate of candidates) {
+          const action = candidate?.action || null;
+          if (
+            (action?.className === 'MessageActionTopicCreate' ||
+             action?.constructor?.name === 'MessageActionTopicCreate') &&
+            Number(candidate?.id || 0) > 0
+          ) {
+            targetId = Number(candidate.id);
+            break;
+          }
+        }
+        if (targetId) break;
+      }
+    }
+
+    if (!targetId) {
+      const updateSummary = updates.map(update => ({
+        type: update?.className || update?.constructor?.name || 'unknown',
+        messageId: Number(update?.message?.id || update?.msg?.id || update?.id || 0),
+        action: update?.message?.action?.className || update?.msg?.action?.className || update?.action?.className || ''
+      }));
+      console.error('创建话题返回结果未识别', {
+        taskId: Number(task.id),
+        sourceTopicId: sourceId,
+        title: info.title,
+        resultType: result?.className || result?.constructor?.name || typeof result,
+        updates: updateSummary
+      });
+      throw new Error('创建目标话题后未获取到话题 ID（已记录 Telegram 返回结构）');
+    }
 
     await p.query(
       'INSERT IGNORE INTO telegram_topic_maps (task_id,source_topic_id,target_topic_id,title,icon_color,icon_emoji_id) VALUES (?,?,?,?,?,?)',
