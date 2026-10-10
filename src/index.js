@@ -115,6 +115,17 @@ async function db() {
     }
 
     await pool.query(`
+      CREATE TABLE IF NOT EXISTS forward_rate_limits (
+        admin_id BIGINT NOT NULL,
+        day_key VARCHAR(10) NOT NULL,
+        forwarded_count INT NOT NULL DEFAULT 0,
+        next_allowed_at DATETIME NULL,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (admin_id, day_key)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `);
+
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS forwarded_messages (
         id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
         task_id BIGINT UNSIGNED NOT NULL,
@@ -520,9 +531,56 @@ function makeUploadFile(message, buffer) {
   return new CustomFile(inferUploadFilename(message), data.length, '', data);
 }
 
-async function sendTelegramMessagesWithoutSource(client, source, target, messages, topicResolver = null, replyResolver = null, filters = null) {
-  // Use Telegram's native forwarding API: no media download/re-upload, preserving
-  // photo/video types, captions, and albums as native forwarded messages.
+const DAILY_FORWARD_LIMIT = 300;
+const FORWARD_GROUP_INTERVAL_MS = 15000;
+
+async function reserveForwardSlot(adminId, messageCount) {
+  const uid = Number(adminId || 0);
+  const count = Math.max(1, Number(messageCount || 1));
+  if (!uid) throw new Error('转发限速缺少账号 ID，已停止发送');
+  const p = await db();
+  const now = new Date();
+  const dayKey = now.toISOString().slice(0, 10);
+  const conn = await p.getConnection();
+  let slotTime = now.getTime();
+  try {
+    await conn.beginTransaction();
+    await conn.query(
+      'INSERT IGNORE INTO forward_rate_limits (admin_id, day_key, forwarded_count, next_allowed_at) VALUES (?, ?, 0, NULL)',
+      [uid, dayKey]
+    );
+    const [rows] = await conn.query(
+      'SELECT forwarded_count, next_allowed_at FROM forward_rate_limits WHERE admin_id=? AND day_key=? FOR UPDATE',
+      [uid, dayKey]
+    );
+    const used = Number(rows[0]?.forwarded_count || 0);
+    if (used + count > DAILY_FORWARD_LIMIT) {
+      const err = new Error('已达到账号每日转发上限（' + DAILY_FORWARD_LIMIT + ' 条），任务已暂停，明天可继续');
+      err.code = 'DAILY_FORWARD_LIMIT';
+      err.dailyLimit = true;
+      await conn.rollback();
+      throw err;
+    }
+    const next = rows[0]?.next_allowed_at ? new Date(rows[0].next_allowed_at).getTime() : 0;
+    slotTime = Math.max(now.getTime(), Number.isFinite(next) ? next : 0);
+    const nextAllowed = new Date(slotTime + FORWARD_GROUP_INTERVAL_MS);
+    await conn.query(
+      'UPDATE forward_rate_limits SET forwarded_count=forwarded_count+?, next_allowed_at=? WHERE admin_id=? AND day_key=?',
+      [count, nextAllowed, uid, dayKey]
+    );
+    await conn.commit();
+  } catch (err) {
+    try { await conn.rollback(); } catch {}
+    throw err;
+  } finally {
+    conn.release();
+  }
+  const waitMs = slotTime - Date.now();
+  if (waitMs > 0) await sleep(waitMs);
+}
+
+async function sendTelegramMessagesWithoutSource(client, source, target, messages, topicResolver = null, replyResolver = null, filters = null, rateAdminId = 0) {
+  // Native forwarding preserves Telegram album grouping and avoids downloading/re-uploading media.
   const list = [...messages].filter(Boolean);
   if (!list.length) return [];
   const sent = [];
@@ -536,19 +594,32 @@ async function sendTelegramMessagesWithoutSource(client, source, target, message
     const messageId = Number(replyId > 0 ? replyId : topic);
     return messageId > 0 ? { replyTo: messageId } : {};
   };
-  const groups = new Map();
+
+  // Collect whole albums before applying filters. If any member passes, forward
+  // the complete album in one request; never forward its members as separate files.
+  const albumGroups = new Map();
   for (const msg of list) {
-    if (!shouldForwardMessage(msg, filters)) continue;
-    const topicId = topicResolver ? Number(await topicResolver(msg) || 0) : 0;
-    const replyId = replyResolver ? Number(await replyResolver(msg, topicId) || 0) : 0;
-    const albumKey = msg.groupedId != null ? String(msg.groupedId) : 'single:' + Number(msg.id);
-    const key = albumKey + ':' + topicId + ':' + replyId;
-    if (!groups.has(key)) groups.set(key, { topicId, replyId, messages: [] });
-    groups.get(key).messages.push(msg);
+    const albumKey = msg.groupedId != null ? 'album:' + String(msg.groupedId) : 'single:' + Number(msg.id);
+    if (!albumGroups.has(albumKey)) albumGroups.set(albumKey, []);
+    albumGroups.get(albumKey).push(msg);
   }
+  const groups = new Map();
+  for (const album of albumGroups.values()) {
+    const items = album.sort((a, b) => Number(a.id) - Number(b.id));
+    if (!items.some(item => shouldForwardMessage(item, filters))) continue;
+    const first = items[0];
+    const topicId = topicResolver ? Number(await topicResolver(first) || 0) : 0;
+    const replyId = replyResolver ? Number(await replyResolver(first, topicId) || 0) : 0;
+    const key = String(first.groupedId != null ? first.groupedId : 'single:' + Number(first.id)) + ':' + topicId + ':' + replyId;
+    if (!groups.has(key)) groups.set(key, { topicId, replyId, messages: [] });
+    groups.get(key).messages.push(...items);
+  }
+
   for (const group of groups.values()) {
     const items = group.messages.sort((a, b) => Number(a.id) - Number(b.id));
     if (!items.length) continue;
+    // Count media items/messages, not just API calls. Albums still travel together.
+    await reserveForwardSlot(rateAdminId, items.length);
     const reply = replyOptions(group.topicId, group.replyId);
     const ids = items.map(item => Number(item.id));
     const result = await client.forwardMessages(target, {
@@ -995,7 +1066,8 @@ async function forwardTelegramMessages(task, sourceChatId, messageIds, ownerId) 
         if (!sourceReplyId) return 0;
         return await getForwardedTargetMessageId(task.id, sourceReplyId);
       },
-      parseFilters(task.filters_json)
+      parseFilters(task.filters_json),
+      ownerId
     );
     const forwardedBySource = new Map(
       (Array.isArray(result) ? result : []).map(item => [Number(item?.sourceId || 0), Number(item?.sent?.id || 0)])
@@ -1015,6 +1087,11 @@ async function forwardTelegramMessages(task, sourceChatId, messageIds, ownerId) 
       [pending[pending.length - 1].id, task.id]
     );
   } catch (err) {
+    if (err?.code === 'DAILY_FORWARD_LIMIT') {
+      console.warn('实时转发达到每日转发上限，暂停任务', task.id, err.message);
+      await p.query('UPDATE forward_tasks SET status="paused" WHERE id=?', [task.id]);
+      return;
+    }
     const wait = getFloodWaitSeconds(err);
     if (wait > 0 && wait <= 180) {
       console.error('MTProto 实时转发限流，等待后重试', task.id, wait, err?.message || err);
@@ -1379,7 +1456,8 @@ async function syncTask(task) {
               if(!sourceReplyId)return 0;
               return await getForwardedTargetMessageId(taskId,sourceReplyId);
             },
-            filters
+            filters,
+            userId
           );
 
           const arr=Array.isArray(out)?out:[];
@@ -1398,6 +1476,11 @@ async function syncTask(task) {
           );
           console.log('历史同步完成',taskId,'源消息',messages.map(item=>item.id).join(','),'当前目标',sentMessageId);
         }catch(singleErr){
+          if (singleErr?.code === 'DAILY_FORWARD_LIMIT') {
+            console.warn('历史同步达到每日转发上限，暂停任务', taskId, singleErr.message);
+            await p.query('UPDATE forward_tasks SET status="paused" WHERE id=? AND admin_id=?', [taskId, userId]);
+            return;
+          }
           const wait=getFloodWaitSeconds(singleErr);
           if(wait>0 && wait<=180){
             console.error('历史同步限流，等待后重试',taskId,id,wait,singleErr?.message||singleErr);
