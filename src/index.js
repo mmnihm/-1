@@ -1549,6 +1549,8 @@ bot.action('tg_login',async ctx=>{
   const uid=Number(ctx.from.id);
   await ctx.answerCbQuery();
   if(userClients.has(uid))return ctx.reply('✅ 你的 Telegram 账号已经登录。\n\n可以直接添加任务。',menu(uid));
+  const current=sessions.get(uid);
+  if(current?.step?.startsWith('tg_'))return ctx.reply('⏳ Telegram 登录流程正在进行中，请按当前提示继续，不要再次点击登录或重复发送手机号。');
   if(!TG_API_ID||!TG_API_HASH)return ctx.reply('❌ 服务器尚未配置 TG_API_ID / TG_API_HASH。\n\n普通用户不需要填写 API ID/API Hash，请管理员在 VPS 的 .env 中配置一次。');
   sessions.set(uid,{step:'tg_phone'});
   return ctx.reply('🔐 Telegram账号登录\n\n普通用户无需填写 API ID 和 API Hash。\n请输入你自己的 Telegram 手机号（含国家区号，例如 +8613812345678）。');
@@ -2070,6 +2072,8 @@ bot.on('text', async (ctx, next) => {
     const phone=rawPhone.replace(/[^\d+]/g,'');
     if(!phone)return ctx.reply('❌ 请输入手机号。');
     session.phone=phone;
+    // 先同步切换状态，再启动异步请求，避免连续消息触发两个独立登录客户端。
+    session.step='tg_requesting_code';
     runTelegramBotLogin(uid).catch(err=>{
       console.error('用户 Telegram 登录失败',uid,err?.message||err);
       sessions.delete(uid);
@@ -2082,6 +2086,9 @@ bot.on('text', async (ctx, next) => {
   }
   if(session.step==='tg_password'){
     const resolve=session.passwordResolve;session.passwordResolve=null;if(resolve)resolve(String(ctx.message.text));return;
+  }
+  if(session.step==='tg_requesting_code'){
+    return ctx.reply('⏳ 正在请求 Telegram 验证码，请勿重复发送手机号；收到验证码后再发送验证码。');
   }
 
 
