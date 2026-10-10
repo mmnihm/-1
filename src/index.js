@@ -34,6 +34,7 @@ const sessions = new Map();
 const runningJobs = new Set();
 const forwardingLocks = new Set();
 const albumQueues = new Map();
+const albumForwardingLocks = new Set();
 const botAlbumQueues = new Map();
 const userClients = new Map();
 const clientStarting = new Map();
@@ -262,7 +263,7 @@ async function attachTelegramEvents(client, ownerId) {
           }
           queue.ids.add(Number(message.id));
           if(queue.timer)clearTimeout(queue.timer);
-          queue.timer=setTimeout(()=>forwardTelegramAlbum(key).catch(err=>console.error('MTProto 相册转发失败',task.id,err?.message||err)),700);
+          queue.timer=setTimeout(()=>forwardTelegramAlbum(key).catch(err=>console.error('MTProto 相册转发失败',task.id,err?.message||err)),1500);
         }else{
           await forwardTelegramMessages(task,sourceChatId,[Number(message.id)],uid);
         }
@@ -328,29 +329,63 @@ async function startTelegramUserClient(userId) {
 async function forwardTelegramAlbum(key) {
   const queue = albumQueues.get(key);
   if (!queue) return;
+
+  // 同一相册可能在多个实时更新中重复触发；确保整组只由一个任务发送。
+  if (albumForwardingLocks.has(key)) {
+    if (queue.timer) clearTimeout(queue.timer);
+    queue.timer = setTimeout(
+      () => forwardTelegramAlbum(key).catch(err => console.error('MTProto 相册转发失败', queue.task.id, err?.message || err)),
+      1200
+    );
+    return;
+  }
+
+  albumForwardingLocks.add(key);
   albumQueues.delete(key);
-  const client = userClients.get(Number(queue.ownerId));
-  const ids = new Set([...queue.ids].map(Number));
-  if (client) {
-    try {
-      const source = await client.getEntity(Number(queue.sourceChatId));
-      for (const id of [...ids]) {
-        const got = await client.getMessages(source, { ids: [id] });
-        const msg = Array.isArray(got) ? got[0] : got;
-        if (!msg?.groupedId) continue;
-        const around = await client.getMessages(source, { limit: 30, around: Number(msg.id) });
-        for (const item of around || []) {
-          if (item?.groupedId != null && String(item.groupedId) === String(msg.groupedId)) ids.add(Number(item.id));
+  try {
+    const client = userClients.get(Number(queue.ownerId));
+    const ids = new Set([...queue.ids].map(Number));
+    if (!client) return;
+
+    const source = await client.getEntity(Number(queue.sourceChatId));
+    // 从 Telegram 重新读取相册附近消息，确保一次 API 请求包含完整 groupedId，
+    // 不依赖实时事件是否在短时间内全部抵达。
+    for (const id of [...ids]) {
+      const got = await client.getMessages(source, { ids: [id] });
+      const msg = Array.isArray(got) ? got[0] : got;
+      if (!msg?.groupedId) continue;
+      const around = await client.getMessages(source, { limit: 40, around: Number(msg.id) });
+      for (const item of around || []) {
+        if (item?.groupedId != null && String(item.groupedId) === String(msg.groupedId)) {
+          ids.add(Number(item.id));
         }
       }
-    } catch (err) {
-      console.error('读取完整相册失败，将暂停本组避免拆散转发', queue.task.id, err?.message || err);
-      return;
+    }
+
+    const sortedIds = [...ids].sort((a, b) => a - b);
+    if (sortedIds.length > 1) {
+      console.log('已收集完整相册，准备整组转发', queue.task.id, '消息ID', sortedIds.join(','));
+    } else {
+      console.log('单条媒体消息，不属于相册', queue.task.id, sortedIds.join(','));
+    }
+    if (sortedIds.length) {
+      await forwardTelegramMessages(queue.task, queue.sourceChatId, sortedIds, queue.ownerId);
+    }
+  } catch (err) {
+    console.error('读取或整组转发相册失败；不会主动拆分发送', queue.task.id, err?.message || err);
+  } finally {
+    albumForwardingLocks.delete(key);
+    // 如果处理期间又收到了相同相册的事件，让后续检查在前一组结束后执行；
+    // 数据库去重会阻止重复发送已完成的媒体项。
+    const newerQueue = albumQueues.get(key);
+    if (newerQueue && !newerQueue.timer) {
+      newerQueue.timer = setTimeout(
+        () => forwardTelegramAlbum(key).catch(err => console.error('MTProto 相册转发失败', newerQueue.task.id, err?.message || err)),
+        1200
+      );
     }
   }
-  if (ids.size) await forwardTelegramMessages(queue.task, queue.sourceChatId, [...ids].sort((a, b) => a - b), queue.ownerId);
 }
-
 function getForumTopicId(message) {
   const reply = message?.replyTo;
   const top = Number(reply?.replyToTopId || 0);
@@ -2697,7 +2732,7 @@ async function handleRealtimeMessage(ctx, message, chatId) {
         } catch (err) {
           console.error('Bot API 相册整组复制失败（未拆分发送）', queue.task.id, ids.join(','), err?.message || err);
         }
-      }, 900);
+      }, 2200);
       continue;
     }
 
