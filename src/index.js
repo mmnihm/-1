@@ -2306,6 +2306,10 @@ bot.on('text', async (ctx, next) => {
   }
 
 
+  if (session.step === 'history_date_start') {
+    return processHistoryDateInput(ctx);
+  }
+
   if (session.step === 'history_start' || session.step === 'history_end') {
     return processHistoryInput(ctx);
   }
