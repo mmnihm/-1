@@ -500,10 +500,13 @@ async function sendTelegramMessagesWithoutSource(client, target, messages, topic
     results.forEach((item, index) => sent.push({ sourceId: Number(ids[index] || ids[0] || 0), sent: item }));
   };
   const replyOptions = (topicId, replyId) => {
+    // GramJS sendFile() expects replyTo to be a numeric message ID. Passing
+    // Api.InputReplyToMessage here can raise "Invalid message type: VirtualClass"
+    // while uploading media. A direct reply stays in its topic automatically;
+    // otherwise reply to the topic starter to place the media in that topic.
     const topic = Number(topicId || 0);
     const messageId = Number(replyId > 0 ? replyId : topic);
-    if (messageId <= 0) return {};
-    return { replyTo: topic > 0 ? new Api.InputReplyToMessage({ replyToMsgId: messageId, topMsgId: topic }) : messageId };
+    return messageId > 0 ? { replyTo: messageId } : {};
   };
   const sendOne = async (msg, topicId, replyId) => {
     const text = String(msg.message || '');
