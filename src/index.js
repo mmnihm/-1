@@ -251,7 +251,7 @@ async function attachTelegramEvents(client, ownerId) {
       for(const task of tasks){
         if(Number(task.target_chat_id)===sourceChatId)continue;
         const filters=parseFilters(task.filters_json);
-        if(!shouldForwardMessage(message,filters))continue;
+        if(message.groupedId==null && !shouldForwardMessage(message,filters))continue;
         if(message.groupedId!=null){
           const key=`album:${task.id}:${sourceChatId}:${String(message.groupedId)}`;
           let queue=albumQueues.get(key);
@@ -328,8 +328,26 @@ async function forwardTelegramAlbum(key) {
   const queue = albumQueues.get(key);
   if (!queue) return;
   albumQueues.delete(key);
-  const ids = [...queue.ids].sort((a, b) => a - b);
-  if (ids.length) await forwardTelegramMessages(queue.task, queue.sourceChatId, ids, queue.ownerId);
+  const client = userClients.get(Number(queue.ownerId));
+  const ids = new Set([...queue.ids].map(Number));
+  if (client) {
+    try {
+      const source = await client.getEntity(Number(queue.sourceChatId));
+      for (const id of [...ids]) {
+        const got = await client.getMessages(source, { ids: [id] });
+        const msg = Array.isArray(got) ? got[0] : got;
+        if (!msg?.groupedId) continue;
+        const around = await client.getMessages(source, { limit: 30, around: Number(msg.id) });
+        for (const item of around || []) {
+          if (item?.groupedId != null && String(item.groupedId) === String(msg.groupedId)) ids.add(Number(item.id));
+        }
+      }
+    } catch (err) {
+      console.error('读取完整相册失败，将暂停本组避免拆散转发', queue.task.id, err?.message || err);
+      return;
+    }
+  }
+  if (ids.size) await forwardTelegramMessages(queue.task, queue.sourceChatId, [...ids].sort((a, b) => a - b), queue.ownerId);
 }
 
 function getForumTopicId(message) {
@@ -1093,11 +1111,10 @@ async function forwardTelegramMessages(task, sourceChatId, messageIds, ownerId) 
       return;
     }
     const wait = getFloodWaitSeconds(err);
-    if (wait > 0 && wait <= 180) {
-      console.error('MTProto 实时转发限流，等待后重试', task.id, wait, err?.message || err);
-      await sleep(wait * 1000 + 500);
-      for (const item of pending) forwardingLocks.delete(item.lockKey);
-      return forwardTelegramMessages(task, sourceChatId, pending.map(item => item.id), ownerId);
+    if (wait > 0) {
+      console.error('MTProto 实时转发遇到 Telegram 限流，暂停任务避免继续触发限制', task.id, wait, err?.message || err);
+      await p.query('UPDATE forward_tasks SET status="paused" WHERE id=?', [task.id]);
+      return;
     }
     console.error(
       'MTProto 实时转发失败',
@@ -1431,12 +1448,11 @@ async function syncTask(task) {
             }catch(err){
               console.error('历史相册读取失败',taskId,id,err?.message||err);
             }
-            const fresh=[];
+            let albumHasPriorForward = false;
             for(const item of messages){
-              if(await isAlreadyForwarded(taskId,item.id)) continue;
-              fresh.push(item);
+              if(await isAlreadyForwarded(taskId,item.id)) { albumHasPriorForward = true; break; }
             }
-            messages=fresh;
+            if (albumHasPriorForward) messages = [];
             if(!messages.length){
               await p.query('UPDATE forward_tasks SET history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
               continue;
@@ -1482,11 +1498,10 @@ async function syncTask(task) {
             return;
           }
           const wait=getFloodWaitSeconds(singleErr);
-          if(wait>0 && wait<=180){
-            console.error('历史同步限流，等待后重试',taskId,id,wait,singleErr?.message||singleErr);
-            await sleep(wait*1000+500);
-            id--;
-            continue;
+          if(wait>0){
+            console.error('历史同步遇到 Telegram 限流，暂停任务等待人工确认',taskId,id,wait,singleErr?.message||singleErr);
+            await p.query('UPDATE forward_tasks SET status="paused" WHERE id=? AND admin_id=?', [taskId, userId]);
+            return;
           }
           console.error('历史单条同步失败，继续下一条',taskId,id,singleErr?.message||singleErr);
           await p.query(
