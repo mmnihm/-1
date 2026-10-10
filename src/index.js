@@ -2017,7 +2017,7 @@ bot.action('history_all', async ctx => {
   );
 });
 
-bot.action(/^history_all_task_(\\d+)$/, async ctx => {
+bot.action(/^history_all_task_(\d+)$/, async ctx => {
   const uid = Number(ctx.from.id);
   const taskId = Number(ctx.match[1]);
   const client = userClients.get(uid);
@@ -2065,7 +2065,7 @@ bot.action('history_dates', async ctx => {
   );
 });
 
-bot.action(/^history_dates_task_(\\d+)$/, async ctx => {
+bot.action(/^history_dates_task_(\d+)$/, async ctx => {
   const uid = Number(ctx.from.id);
   const taskId = Number(ctx.match[1]);
   if (!userClients.has(uid)) {
@@ -2112,9 +2112,9 @@ async function processHistoryDateInput(ctx) {
   const uid = Number(ctx.from.id);
   const session = sessions.get(uid);
   if (!session || session.step !== 'history_date_start') return false;
-  const lines = String(ctx.message?.text || '').trim().split(/\\r?\\n/).map(x => x.trim()).filter(Boolean);
+  const lines = String(ctx.message?.text || '').trim().split(/\r?\n/).map(x => x.trim()).filter(Boolean);
   const parseDate = value => {
-    const m = value.match(/^(\\d{4})-(\\d{2})-(\\d{2})[ T](\\d{2}):(\\d{2})(?::(\\d{2}))?$/);
+    const m = value.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/);
     if (!m) return null;
     const [_, y, mo, d, h, mi, sec = '0'] = m;
     const date = new Date(Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h) - 8, Number(mi), Number(sec)));
@@ -2122,7 +2122,7 @@ async function processHistoryDateInput(ctx) {
     return date;
   };
   if (lines.length < 2) {
-    await ctx.reply('❌ 请发送两行时间：\n2026-10-01 00:00\\n2026-10-10 23:59');
+    await ctx.reply('❌ 请发送两行时间：\n2026-10-01 00:00\n2026-10-10 23:59');
     return true;
   }
   const startDate = parseDate(lines[0]);
