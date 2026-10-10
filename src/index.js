@@ -2038,7 +2038,7 @@ bot.action(/^history_all_task_(\\d+)$/, async ctx => {
       return ctx.reply('❌ 无法读取源频道最新消息，请确认账号有访问权限。', menu(uid));
     }
     await p.query(
-      'UPDATE forward_tasks SET history_next_id=1,history_end_id=?,history_total=?,history_processed=0,history_skipped=0,history_failed=0,history_done=0,status="paused" WHERE id=? AND admin_id=?',
+      'UPDATE forward_tasks SET history_next_id=1,history_end_id=?,history_total=?,history_start_date=NULL,history_end_date=NULL,history_processed=0,history_skipped=0,history_failed=0,history_done=0,status="paused" WHERE id=? AND admin_id=?',
       [latestId, latestId, taskId, uid]
     );
     await ctx.answerCbQuery('已设置全部历史');
@@ -2122,7 +2122,7 @@ async function processHistoryDateInput(ctx) {
     return date;
   };
   if (lines.length < 2) {
-    await ctx.reply('❌ 请发送两行时间：\\n2026-10-01 00:00\\n2026-10-10 23:59');
+    await ctx.reply('❌ 请发送两行时间：\n2026-10-01 00:00\\n2026-10-10 23:59');
     return true;
   }
   const startDate = parseDate(lines[0]);
@@ -2200,7 +2200,7 @@ async function processHistoryInput(ctx) {
       const startId=Number(ids[0]), endId=Number(ids[1]);
       if(endId<startId){ await ctx.reply('❌ 结束消息不能小于起始消息，请重新发送。'); return true; }
       const total=endId-startId+1;
-      await p.query('UPDATE forward_tasks SET history_next_id=?,history_end_id=?,history_total=?,history_processed=0,history_skipped=0,history_failed=0,history_done=0,status="paused" WHERE id=? AND admin_id=?',
+      await p.query('UPDATE forward_tasks SET history_next_id=?,history_end_id=?,history_total=?,history_start_date=NULL,history_end_date=NULL,history_processed=0,history_skipped=0,history_failed=0,history_done=0,status="paused" WHERE id=? AND admin_id=?',
         [startId,endId,total,taskId,uid]);
       sessions.delete(uid);
       await ctx.reply('✅ 已设置任务 #'+taskId+'\n历史范围：'+startId+' → '+endId+'\n总数：'+total+'\n\n现在点击“▶️ 开始同步”。',menu(uid));
@@ -2218,7 +2218,7 @@ async function processHistoryInput(ctx) {
     return true;
   }
   const total=endId-startId+1;
-  await p.query('UPDATE forward_tasks SET history_next_id=?,history_end_id=?,history_total=?,history_processed=0,history_skipped=0,history_failed=0,history_done=0,status="paused" WHERE id=? AND admin_id=?',
+  await p.query('UPDATE forward_tasks SET history_next_id=?,history_end_id=?,history_total=?,history_start_date=NULL,history_end_date=NULL,history_processed=0,history_skipped=0,history_failed=0,history_done=0,status="paused" WHERE id=? AND admin_id=?',
     [startId,endId,total,taskId,uid]);
   sessions.delete(uid);
   await ctx.reply('✅ 已设置任务 #'+taskId+'\n历史范围：'+startId+' → '+endId+'\n总数：'+total+'\n\n现在点击“▶️ 开始同步”。',menu(uid));
