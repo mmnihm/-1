@@ -1730,9 +1730,9 @@ bot.action(/^syncset_task_(\d+)$/, async ctx => {
   const realtime = Number(rows[0].realtime) === 1;
   await ctx.answerCbQuery();
   return ctx.reply(
-    `⚙️ 任务 #${taskId} 同步设置\n\n🧵 话题群：${topicClone ? '✅ 完整克隆' : '❌ 不克隆'}\n💬 评论区：${commentClone ? '✅ 克隆' : '❌ 不克隆'}\n🔄 实时同步：${realtime ? '✅ 开启' : '❌ 关闭'}`,
+    `⚙️ 任务 #${taskId} 同步设置\n\n🧵 话题 + 内容：${topicClone ? '✅ 克隆中' : '❌ 已关闭'}\n💬 评论区：${commentClone ? '✅ 克隆' : '❌ 不克隆'}\n🔄 实时同步：${realtime ? '✅ 开启' : '❌ 关闭'}`,
     Markup.inlineKeyboard([
-      [Markup.button.callback(`🧵 完整克隆话题群 ${topicClone ? '✅' : '❌'}`,`syncset_${taskId}_topics`)],
+      [Markup.button.callback(`🧵 话题 + 内容克隆 ${topicClone ? '✅' : '❌'}`,`syncset_${taskId}_topics`)],
       [Markup.button.callback(`💬 克隆评论区 ${commentClone ? '✅' : '❌'}`,`syncset_${taskId}_comments`)],
       [Markup.button.callback('🛠 补齐已有帖子评论',`syncset_${taskId}_repair_comments`)],
       [Markup.button.callback(`🔄 实时同步 ${realtime ? '✅' : '❌'}`,`syncset_${taskId}_realtime`)],
@@ -1808,7 +1808,7 @@ bot.action(/^syncset_(\d+)_(topics|comments)$/, async ctx => {
   settings[key] = settings[key] === false;
   await p.query('UPDATE forward_tasks SET filters_json=? WHERE id=? AND admin_id=?',[JSON.stringify(settings),taskId,Number(ctx.from.id)]);
   await ctx.answerCbQuery(settings[key] ? '已开启' : '已关闭');
-  return ctx.reply(`⚙️ 任务 #${taskId}：${kind === 'topics' ? '完整克隆话题群' : '克隆评论区'} 已${settings[key] ? '开启' : '关闭'}。`,menu(ctx.from.id));
+  return ctx.reply(`⚙️ 任务 #${taskId}：${kind === 'topics' ? '话题 + 内容克隆' : '克隆评论区'} 已${settings[key] ? '开启' : '关闭'}。`,menu(ctx.from.id));
 });
 
 bot.action(/^syncset_(\d+)_realtime$/, async ctx => {
