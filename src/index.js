@@ -1558,29 +1558,44 @@ bot.action(/^syncset_task_(\d+)$/, async ctx => {
 bot.action(/^syncset_(\d+)_repair_comments$/, async ctx => {
   const taskId = Number(ctx.match[1]);
   const uid = Number(ctx.from.id);
-  const p = await db();
-  const [rows] = await p.query(
-    'SELECT * FROM forward_tasks WHERE id=? AND admin_id=? LIMIT 1',
-    [taskId, uid]
-  );
-  if (!rows.length) return ctx.answerCbQuery('任务不存在');
-  if (!userClients.has(uid)) return ctx.answerCbQuery('请先登录 Telegram 账号');
-  if (parseFilters(rows[0].filters_json).clone_comments === false) {
-    return ctx.answerCbQuery('请先开启克隆评论区');
+
+  // Answer Telegram's callback before any database/network work; callback queries expire quickly.
+  try {
+    await ctx.answerCbQuery('已收到');
+  } catch (err) {
+    console.warn('评论补齐按钮回调已过期，继续检查任务', err?.description || err?.message || err);
   }
-  if (discussionRepairJobs.has(taskId)) return ctx.answerCbQuery('这个任务正在补齐评论');
-  discussionRepairJobs.add(taskId);
-  await ctx.answerCbQuery('已开始');
-  await ctx.reply(`🛠 已开始补齐任务 #${taskId} 的历史评论区。\n\n会逐条检查已转发的频道帖子，补齐评论映射并同步尚未复制的评论。任务可能需要一些时间；请保持机器人运行，不要重复点击。`);
-  repairDiscussionMapsForTask(rows[0], uid)
-    .then(async result => {
-      await bot.telegram.sendMessage(uid, `✅ 任务 #${taskId} 评论区补齐检查完成。\n已检查帖子：${result.checked}/${result.total}\n处理异常：${result.errors}\n\n没有评论区或目标频道未关联讨论群的帖子会自动跳过。`);
-    })
-    .catch(async err => {
-      console.error('历史评论区补齐任务失败', taskId, err?.message || err);
-      try { await bot.telegram.sendMessage(uid, `❌ 任务 #${taskId} 评论区补齐失败：${err?.message || err}`); } catch {}
-    })
-    .finally(() => discussionRepairJobs.delete(taskId));
+
+  try {
+    const p = await db();
+    const [rows] = await p.query(
+      'SELECT * FROM forward_tasks WHERE id=? AND admin_id=? LIMIT 1',
+      [taskId, uid]
+    );
+    if (!rows.length) return ctx.reply('❌ 任务不存在或无权操作。');
+    if (!userClients.has(uid)) return ctx.reply('❌ 请先登录 Telegram 账号，再补齐评论区。');
+    if (parseFilters(rows[0].filters_json).clone_comments === false) {
+      return ctx.reply('❌ 请先在同步设置中开启「克隆评论区」。');
+    }
+    if (discussionRepairJobs.has(taskId)) {
+      return ctx.reply('⏳ 这个任务已经在补齐评论区，请勿重复点击。');
+    }
+
+    discussionRepairJobs.add(taskId);
+    await ctx.reply(\`🛠 已开始补齐任务 #\${taskId} 的历史评论区。\\n\\n会逐条检查已转发的频道帖子，并尝试补齐评论映射和遗漏评论。任务可能需要一些时间，请保持机器人运行。\`);
+    repairDiscussionMapsForTask(rows[0], uid)
+      .then(async result => {
+        await bot.telegram.sendMessage(uid, \`✅ 任务 #\${taskId} 评论区补齐检查完成。\\n已检查帖子：\${result.checked}/\${result.total}\\n处理异常：\${result.errors}\\n\\n没有可访问评论区或目标频道未关联讨论群的帖子会自动跳过。\`);
+      })
+      .catch(async err => {
+        console.error('历史评论区补齐任务失败', taskId, err?.message || err);
+        try { await bot.telegram.sendMessage(uid, \`❌ 任务 #\${taskId} 评论区补齐失败：\${err?.message || err}\`); } catch {}
+      })
+      .finally(() => discussionRepairJobs.delete(taskId));
+  } catch (err) {
+    console.error('处理评论区补齐按钮失败', taskId, err?.message || err);
+    try { await ctx.reply(\`❌ 无法启动评论区补齐：\${err?.message || err}\`); } catch {}
+  }
 });
 bot.action(/^syncset_(\d+)_(topics|comments)$/, async ctx => {
   const taskId = Number(ctx.match[1]);
