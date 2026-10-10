@@ -37,6 +37,7 @@ const clientStarting = new Map();
 const botUserNotifications = new Set();
 const topicCloneLocks = new Map();
 const discussionRepairJobs = new Set();
+const discussionAlbumQueues = new Map();
 
 const DEFAULT_FILTERS = {
   text: true,
@@ -617,6 +618,59 @@ async function sendDiscussionMessage(client, targetChat, message, replyTo=0) {
   }
 }
 
+async function sendDiscussionAlbum(client, targetChat, comments, replyTo=0) {
+  const media = comments.filter(item => item?.media).sort((a,b) => Number(a.id)-Number(b.id));
+  if (!media.length) return [];
+  const options = replyTo > 0 ? { replyTo } : {};
+  try {
+    const result = await client.sendFile(targetChat, {
+      file: media.map(item => item.media),
+      caption: media.map(item => String(item.message || '')),
+      ...options
+    });
+    return (Array.isArray(result) ? result : [result]).filter(Boolean);
+  } catch (firstErr) {
+    // 有些 Telegram 媒体对象不能直接复用；下载原媒体后仍以一组发送。
+    try {
+      const buffers = [];
+      for (const item of media) {
+        const buffer = await client.downloadMedia(item, {});
+        if (!buffer) throw new Error('下载相册媒体失败: ' + item.id);
+        buffers.push(buffer);
+      }
+      const result = await client.sendFile(targetChat, {
+        file: buffers,
+        caption: media.map(item => String(item.message || '')),
+        ...options
+      });
+      return (Array.isArray(result) ? result : [result]).filter(Boolean);
+    } catch (secondErr) {
+      console.error('评论区相册整组发送失败，改为逐条发送', secondErr?.message || firstErr?.message || firstErr);
+      const sent = [];
+      for (const item of media) {
+        try {
+          let result;
+          try {
+            result = await client.sendMessage(targetChat, { message: item, ...options });
+          } catch (sendErr) {
+            const buffer = await client.downloadMedia(item, {});
+            if (!buffer) throw sendErr;
+            result = await client.sendFile(targetChat, {
+              file: buffer,
+              caption: String(item.message || ''),
+              ...options
+            });
+          }
+          if (result?.id) sent.push(result);
+        } catch (err) {
+          console.error('评论区相册单项发送失败', item.id, err?.message || err);
+        }
+      }
+      return sent;
+    }
+  }
+}
+
 async function cloneDiscussionComments(client, task, sourceChannel, sourcePostId, targetPostId) {
   const filters = parseFilters(task.filters_json);
   if (filters.clone_comments === false) return;
@@ -650,29 +704,71 @@ async function cloneDiscussionComments(client, task, sourceChannel, sourcePostId
     return;
   }
 
-  for (const comment of comments) {
-    const [exists] = await p.query('SELECT target_message_id FROM telegram_discussion_message_maps WHERE task_id=? AND source_chat_id=? AND source_message_id=? LIMIT 1',
-      [Number(task.id),Number(comment.chatId),Number(comment.id)]);
-    if (exists.length) continue;
+  for (let index = 0; index < comments.length;) {
+    const comment = comments[index];
+    const albumId = comment?.groupedId != null ? String(comment.groupedId) : '';
+    let batch = [comment];
+    index++;
 
+    // 同一 groupedId 的评论媒体必须作为相册整组发送，不能逐条拆开。
+    if (albumId) {
+      while (index < comments.length && comments[index]?.groupedId != null &&
+             String(comments[index].groupedId) === albumId) {
+        batch.push(comments[index]);
+        index++;
+      }
+    }
+
+    const eligible = [];
+    for (const item of batch) {
+      const [exists] = await p.query(
+        'SELECT target_message_id FROM telegram_discussion_message_maps WHERE task_id=? AND source_chat_id=? AND source_message_id=? LIMIT 1',
+        [Number(task.id), Number(item.chatId ?? sourceInfo.chatId), Number(item.id)]
+      );
+      if (!exists.length && shouldForwardMessage(item, filters) &&
+          applyContentFiltersToMessage(item, filters)) eligible.push(item);
+    }
+    if (!eligible.length) continue;
+
+    // 若相册里只有部分项目尚未同步，不能把已同步的项目重复发送；
+    // 但保留剩余项目的组发送，确保每条源消息都有对应目标消息映射。
     let replyTo = Number(targetInfo.root.id);
-    const sourceReplyId = getDirectReplyMessageId(comment, Number(sourceInfo.root.id));
+    const sourceReplyId = getDirectReplyMessageId(eligible[0], Number(sourceInfo.root.id));
     if (sourceReplyId > 0) {
-      const [parent] = await p.query('SELECT target_message_id FROM telegram_discussion_message_maps WHERE task_id=? AND source_chat_id=? AND source_message_id=? LIMIT 1',
-        [Number(task.id),Number(comment.chatId),Number(sourceReplyId)]);
+      const [parent] = await p.query(
+        'SELECT target_message_id FROM telegram_discussion_message_maps WHERE task_id=? AND source_chat_id=? AND source_message_id=? LIMIT 1',
+        [Number(task.id), Number(eligible[0].chatId ?? sourceInfo.chatId), Number(sourceReplyId)]
+      );
       if (parent.length) replyTo = Number(parent[0].target_message_id);
     }
 
-    if (!shouldForwardMessage(comment, filters)) continue;
-    const filteredComment = applyContentFiltersToMessage(comment, filters);
-    if (!filteredComment) continue;
     try {
-      const sent = await sendDiscussionMessage(client, targetInfo.chat, filteredComment, replyTo);
-      if (!sent?.id) continue;
-      await p.query('INSERT IGNORE INTO telegram_discussion_message_maps (task_id,source_chat_id,source_message_id,target_chat_id,target_message_id) VALUES (?,?,?,?,?)',
-        [Number(task.id),Number(comment.chatId),Number(comment.id),Number(targetInfo.chatId),Number(sent.id)]);
+      const targetChat = targetInfo.chat;
+      if (albumId && eligible.filter(item => item.media).length > 1) {
+        const sentItems = await sendDiscussionAlbum(client, targetChat, eligible, replyTo);
+        for (let j = 0; j < eligible.filter(item => item.media).length; j++) {
+          const item = eligible.filter(entry => entry.media)[j];
+          const sent = sentItems[j];
+          if (!sent?.id) continue;
+          await p.query(
+            'INSERT IGNORE INTO telegram_discussion_message_maps (task_id,source_chat_id,source_message_id,target_chat_id,target_message_id) VALUES (?,?,?,?,?)',
+            [Number(task.id), Number(item.chatId ?? sourceInfo.chatId), Number(item.id), Number(targetInfo.chatId), Number(sent.id)]
+          );
+        }
+      } else {
+        for (const item of eligible) {
+          const filtered = applyContentFiltersToMessage(item, filters);
+          if (!filtered) continue;
+          const sent = await sendDiscussionMessage(client, targetChat, filtered, replyTo);
+          if (!sent?.id) continue;
+          await p.query(
+            'INSERT IGNORE INTO telegram_discussion_message_maps (task_id,source_chat_id,source_message_id,target_chat_id,target_message_id) VALUES (?,?,?,?,?)',
+            [Number(task.id), Number(item.chatId ?? sourceInfo.chatId), Number(item.id), Number(targetInfo.chatId), Number(sent.id)]
+          );
+        }
+      }
     } catch (err) {
-      console.error('同步评论失败', task.id, comment.id, err?.message || err);
+      console.error('同步评论失败', task.id, eligible.map(item => item.id).join(','), err?.message || err);
     }
   }
 }
@@ -784,6 +880,30 @@ async function forwardDiscussionRealtime(task, sourceChatId, messageId, ownerId)
     [Number(task.id),Number(sourceChatId),Number(messageId)]
   );
   if (exists.length) return;
+
+  if (message.groupedId != null) {
+    // 实时相册稍作合并等待，再通过历史评论扫描器整组补齐；
+    // 数据库映射负责去重，避免每张媒体各发一次。
+    const albumKey = `discussion-album:${Number(task.id)}:${Number(map.source_post_id)}`;
+    let queued = discussionAlbumQueues.get(albumKey);
+    if (!queued) {
+      queued = { task, ownerId: Number(ownerId), sourceChatId: Number(sourceChatId), sourcePostId: Number(map.source_post_id), targetPostId: Number(map.target_post_id), timer: null };
+      discussionAlbumQueues.set(albumKey, queued);
+    }
+    if (queued.timer) clearTimeout(queued.timer);
+    queued.timer = setTimeout(async () => {
+      discussionAlbumQueues.delete(albumKey);
+      try {
+        const liveClient = userClients.get(Number(queued.ownerId));
+        if (!liveClient) return;
+        const channel = await liveClient.getEntity(Number(queued.task.source_chat_id));
+        await cloneDiscussionComments(liveClient, queued.task, channel, queued.sourcePostId, queued.targetPostId);
+      } catch (err) {
+        console.error('实时评论相册同步失败', queued.task.id, queued.sourcePostId, err?.message || err);
+      }
+    }, 900);
+    return;
+  }
 
   let replyTo = Number(map.target_discussion_root_id);
   const sourceReplyId = getDirectReplyMessageId(message, Number(map.source_discussion_root_id));
