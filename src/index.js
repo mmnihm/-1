@@ -322,11 +322,23 @@ function getForumTopicId(message) {
   const reply = message?.replyTo;
   const top = Number(reply?.replyToTopId || 0);
   if (top > 0) return top;
+
   const replyToMsgId = Number(reply?.replyToMsgId || 0);
-  if (reply?.forumTopic && replyToMsgId > 0) return replyToMsgId;
-  if (message?.action?.className === 'MessageActionTopicCreate' && Number(message?.id) > 0) {
+  const isForumReply = Boolean(
+    reply?.forumTopic ||
+    reply?.className === 'MessageReplyHeader' && reply?.forumTopic ||
+    reply?.constructor?.name === 'MessageReplyHeader' && reply?.forumTopic
+  );
+  if (isForumReply && replyToMsgId > 0) return replyToMsgId;
+
+  const actionName = message?.action?.className || message?.action?.constructor?.name || '';
+  if (/MessageActionTopicCreate/i.test(actionName) && Number(message?.id) > 0) {
     return Number(message.id);
   }
+
+  // 某些频道话题的首条普通消息没有 TopicCreate action，但 Telegram 会标记 forumTopic。
+  // 此时 replyToMsgId 是该话题的根消息 ID；不再把普通消息 ID 猜成话题 ID。
+  if (reply?.forumTopic && replyToMsgId > 0) return replyToMsgId;
   return 0;
 }
 
@@ -1146,7 +1158,7 @@ function menu(userId) {
   return Markup.inlineKeyboard([
     [Markup.button.callback(loggedIn?'✅ Telegram账号已登录':'🔐 Telegram账号登录','tg_login')],
     [Markup.button.callback('➕ 添加任务','add_task')],
-    [Markup.button.callback('🕘 设置历史范围','set_history')],
+    [Markup.button.callback('📚 全部历史克隆','history_all'),Markup.button.callback('🕘 按时间/消息范围克隆','set_history')],
     [Markup.button.callback('▶️ 开始同步','start_sync'),Markup.button.callback('⏸ 暂停同步','pause_sync')],
     [Markup.button.callback('🔄 实时转发','realtime'),Markup.button.callback('⚙️ 同步设置','sync_settings')],
     [Markup.button.callback('🎛 过滤设置','filters'),Markup.button.callback('📊 任务进度','progress')],
@@ -1971,6 +1983,60 @@ function extractHistoryIdsFromText(text) {
   if (nums.length && nums.every(Number.isInteger) && nums.every(n => n > 0)) return [...new Set(nums)];
   return [];
 }
+
+bot.action('history_all', async ctx => {
+  const uid = Number(ctx.from.id);
+  const client = userClients.get(uid);
+  if (!client) {
+    await ctx.answerCbQuery('请先登录 Telegram');
+    return ctx.reply('❌ 请先登录 Telegram 账号。', menu(uid));
+  }
+  const rows = await getTasks(uid);
+  if (!rows.length) return ctx.answerCbQuery('没有任务');
+  await ctx.answerCbQuery();
+  return ctx.reply(
+    '📚 全部历史克隆\n请选择要克隆全部历史消息的任务：',
+    Markup.inlineKeyboard(rows.map(t => [
+      Markup.button.callback('#' + t.id + ' ' + t.source_chat_id + ' → ' + t.target_chat_id, 'history_all_task_' + t.id)
+    ]))
+  );
+});
+
+bot.action(/^history_all_task_(\\d+)$/, async ctx => {
+  const uid = Number(ctx.from.id);
+  const taskId = Number(ctx.match[1]);
+  const client = userClients.get(uid);
+  if (!client) {
+    await ctx.answerCbQuery('请先登录 Telegram');
+    return ctx.reply('❌ 请先登录 Telegram 账号。', menu(uid));
+  }
+  const p = await db();
+  const [rows] = await p.query('SELECT * FROM forward_tasks WHERE id=? AND admin_id=?', [taskId, uid]);
+  if (!rows.length) return ctx.answerCbQuery('任务不存在');
+  const task = rows[0];
+  try {
+    const source = await client.getEntity(Number(task.source_chat_id));
+    const latest = await client.getMessages(source, { limit: 1 });
+    const latestId = Number((Array.isArray(latest) ? latest[0] : latest)?.id || 0);
+    if (!latestId) {
+      await ctx.answerCbQuery('源频道没有可读取的消息');
+      return ctx.reply('❌ 无法读取源频道最新消息，请确认账号有访问权限。', menu(uid));
+    }
+    await p.query(
+      'UPDATE forward_tasks SET history_next_id=1,history_end_id=?,history_total=?,history_processed=0,history_skipped=0,history_failed=0,history_done=0,status="paused" WHERE id=? AND admin_id=?',
+      [latestId, latestId, taskId, uid]
+    );
+    await ctx.answerCbQuery('已设置全部历史');
+    return ctx.reply(
+      '✅ 已设置全部历史克隆\n任务：#' + taskId + '\n消息范围：1 → ' + latestId + '\n\n已有转发记录会跳过，未转发的消息会继续克隆。点击“▶️ 开始同步”启动。',
+      menu(uid)
+    );
+  } catch (err) {
+    console.error('设置全部历史范围失败', taskId, err?.message || err);
+    await ctx.answerCbQuery('读取源频道失败');
+    return ctx.reply('❌ 读取源频道失败：' + String(err?.message || err).slice(0, 300), menu(uid));
+  }
+});
 
 bot.action('set_history', async ctx => {
   const rows = await getTasks(ctx.from.id);
