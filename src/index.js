@@ -36,6 +36,7 @@ const userClients = new Map();
 const clientStarting = new Map();
 const botUserNotifications = new Set();
 const topicCloneLocks = new Map();
+const discussionRepairJobs = new Set();
 
 const DEFAULT_FILTERS = {
   text: true,
@@ -564,10 +565,29 @@ async function getDiscussionRoot(client, channelEntity, postId) {
       peer: channelEntity,
       msgId: Number(postId)
     }));
-    const root = result?.messages?.[0];
-    if (!root?.id || root.chatId == null) return null;
-    const chat = await client.getEntity(Number(root.chatId));
-    return { root, chat };
+    // GetDiscussionMessage may return the original channel post before the
+    // forwarded root message in the linked discussion group. Never assume
+    // messages[0] is the discussion root.
+    const sourcePeerId = Number(await client.getPeerId(channelEntity));
+    let root = null;
+    let discussionChatId = 0;
+    for (const candidate of (result?.messages || [])) {
+      if (!candidate?.id) continue;
+      let candidateChatId = 0;
+      try {
+        candidateChatId = candidate.peerId
+          ? Number(await client.getPeerId(candidate.peerId))
+          : Number(candidate.chatId || 0);
+      } catch {}
+      if (Number.isSafeInteger(candidateChatId) && candidateChatId !== 0 && candidateChatId !== sourcePeerId) {
+        root = candidate;
+        discussionChatId = candidateChatId;
+        break;
+      }
+    }
+    if (!root || !discussionChatId) return null;
+    const chat = await client.getEntity(discussionChatId);
+    return { root, chat, chatId: discussionChatId };
   } catch (err) {
     if (!/MSG_ID_INVALID|CHANNEL_INVALID|PEER_ID_INVALID/i.test(String(err?.message || ''))) {
       console.error('读取频道评论区失败', postId, err?.message || err);
@@ -613,7 +633,7 @@ async function cloneDiscussionComments(client, task, sourceChannel, sourcePostId
 
   const p = await db();
   await p.query('INSERT INTO telegram_discussion_maps (task_id,source_post_id,source_discussion_chat_id,source_discussion_root_id,target_post_id,target_discussion_chat_id,target_discussion_root_id) VALUES (?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE target_post_id=VALUES(target_post_id),target_discussion_chat_id=VALUES(target_discussion_chat_id),target_discussion_root_id=VALUES(target_discussion_root_id)',
-    [Number(task.id),Number(sourcePostId),Number(sourceInfo.root.chatId),Number(sourceInfo.root.id),Number(targetPostId),Number(targetInfo.root.chatId),Number(targetInfo.root.id)]);
+    [Number(task.id),Number(sourcePostId),Number(sourceInfo.chatId),Number(sourceInfo.root.id),Number(targetPostId),Number(targetInfo.chatId),Number(targetInfo.root.id)]);
 
   let comments = [];
   try {
@@ -655,6 +675,46 @@ async function cloneDiscussionComments(client, task, sourceChannel, sourcePostId
       console.error('同步评论失败', task.id, comment.id, err?.message || err);
     }
   }
+}
+
+
+async function repairDiscussionMapsForTask(task, ownerId) {
+  const client = userClients.get(Number(ownerId));
+  if (!client) throw new Error('请先登录 Telegram 账号');
+  const filters = parseFilters(task.filters_json);
+  if (filters.clone_comments === false) throw new Error('请先开启“克隆评论区”设置');
+  const source = await client.getEntity(Number(task.source_chat_id));
+  if (source?.className !== 'Channel') throw new Error('源必须是频道，群组任务不支持频道评论区克隆');
+  await client.getEntity(Number(task.target_chat_id));
+  await ensureDiscussionMessageTable();
+  const p = await db();
+  const [rows] = await p.query(
+    'SELECT source_message_id,target_message_id FROM forwarded_messages WHERE task_id=? AND target_message_id IS NOT NULL ORDER BY source_message_id ASC',
+    [Number(task.id)]
+  );
+  let checked = 0;
+  let errors = 0;
+  for (const row of rows) {
+    const sourcePostId = Number(row.source_message_id || 0);
+    const targetPostId = Number(row.target_message_id || 0);
+    if (!sourcePostId || !targetPostId) continue;
+    try {
+      await cloneDiscussionComments(client, task, source, sourcePostId, targetPostId);
+    } catch (err) {
+      errors++;
+      console.error('补齐已有帖子评论失败', task.id, sourcePostId, err?.message || err);
+      const wait = getFloodWaitSeconds(err);
+      if (wait > 0 && wait <= 180) await sleep(wait * 1000 + 500);
+    }
+    checked++;
+    if (checked % 50 === 0) {
+      console.log('评论区补齐进度', task.id, checked, '/', rows.length, 'errors=', errors);
+      await sleep(250);
+    } else {
+      await sleep(100);
+    }
+  }
+  return { checked, total: rows.length, errors };
 }
 
 async function forwardDiscussionRealtime(task, sourceChatId, messageId, ownerId) {
@@ -1061,6 +1121,18 @@ async function syncTask(task) {
       for(let id=nextId;id<=batchEnd;id++){
         try{
           if(await isAlreadyForwarded(taskId,id)){
+            // Older versions may have forwarded the post before comment mapping existed.
+            if (source.className === 'Channel' && filters.clone_comments !== false) {
+              const [mappedPost] = await p.query(
+                'SELECT target_message_id FROM forwarded_messages WHERE task_id=? AND source_message_id=? AND target_message_id IS NOT NULL LIMIT 1',
+                [taskId,id]
+              );
+              const mappedTargetId = Number(mappedPost[0]?.target_message_id || 0);
+              if (mappedTargetId > 0) {
+                try { await cloneDiscussionComments(client, task, source, id, mappedTargetId); }
+                catch (repairErr) { console.error('补齐已有帖子评论映射失败',taskId,id,repairErr?.message||repairErr); }
+              }
+            }
             await p.query('UPDATE forward_tasks SET history_next_id=? WHERE id=? AND admin_id=?',[id+1,taskId,userId]);
             continue;
           }
@@ -1476,10 +1548,39 @@ bot.action(/^syncset_task_(\d+)$/, async ctx => {
     Markup.inlineKeyboard([
       [Markup.button.callback(`🧵 完整克隆话题群 ${topicClone ? '✅' : '❌'}`,`syncset_${taskId}_topics`)],
       [Markup.button.callback(`💬 克隆评论区 ${commentClone ? '✅' : '❌'}`,`syncset_${taskId}_comments`)],
+      [Markup.button.callback('🛠 补齐已有帖子评论',`syncset_${taskId}_repair_comments`)],
       [Markup.button.callback(`🔄 实时同步 ${realtime ? '✅' : '❌'}`,`syncset_${taskId}_realtime`)],
       [Markup.button.callback('⬅️ 返回主菜单','menu_back')]
     ])
   );
+});
+
+bot.action(/^syncset_(\d+)_repair_comments$/, async ctx => {
+  const taskId = Number(ctx.match[1]);
+  const uid = Number(ctx.from.id);
+  const p = await db();
+  const [rows] = await p.query(
+    'SELECT * FROM forward_tasks WHERE id=? AND admin_id=? LIMIT 1',
+    [taskId, uid]
+  );
+  if (!rows.length) return ctx.answerCbQuery('任务不存在');
+  if (!userClients.has(uid)) return ctx.answerCbQuery('请先登录 Telegram 账号');
+  if (parseFilters(rows[0].filters_json).clone_comments === false) {
+    return ctx.answerCbQuery('请先开启克隆评论区');
+  }
+  if (discussionRepairJobs.has(taskId)) return ctx.answerCbQuery('这个任务正在补齐评论');
+  discussionRepairJobs.add(taskId);
+  await ctx.answerCbQuery('已开始');
+  await ctx.reply(\`🛠 已开始补齐任务 #\${taskId} 的历史评论区。\\n\\n会逐条检查已转发的频道帖子，补齐评论映射并同步尚未复制的评论。任务可能需要一些时间；请保持机器人运行，不要重复点击。\`);
+  repairDiscussionMapsForTask(rows[0], uid)
+    .then(async result => {
+      await bot.telegram.sendMessage(uid, \`✅ 任务 #\${taskId} 评论区补齐检查完成。\\n已检查帖子：\${result.checked}/\${result.total}\\n处理异常：\${result.errors}\\n\\n没有评论区或目标频道未关联讨论群的帖子会自动跳过。\`);
+    })
+    .catch(async err => {
+      console.error('历史评论区补齐任务失败', taskId, err?.message || err);
+      try { await bot.telegram.sendMessage(uid, \`❌ 任务 #\${taskId} 评论区补齐失败：\${err?.message || err}\`); } catch {}
+    })
+    .finally(() => discussionRepairJobs.delete(taskId));
 });
 
 bot.action(/^syncset_(\d+)_(topics|comments)$/, async ctx => {
