@@ -384,6 +384,29 @@ async function startTelegramUserClient(userId) {
   try{return await promise;}finally{clientStarting.delete(uid);}
 }
 
+async function getCompleteAlbumMessages(client, source, message) {
+  const groupedId = message?.groupedId;
+  const centerId = Number(message?.id || 0);
+  if (groupedId == null || !centerId) return message ? [message] : [];
+
+  // Telegram album message IDs are adjacent. Fetch a bounded ID window (metadata only),
+  // instead of using the unsupported "around" option or loading channel history.
+  const ids = [];
+  for (let id = Math.max(1, centerId - 10); id <= centerId + 10; id++) ids.push(id);
+  const result = await client.getMessages(source, { ids });
+  const candidates = (Array.isArray(result) ? result : [result]).filter(Boolean);
+  const album = candidates
+    .filter(item => item.groupedId != null && String(item.groupedId) === String(groupedId))
+    .sort((a, b) => Number(a.id) - Number(b.id));
+
+  if (album.length < 2) {
+    const err = new Error('无法确认完整相册，已阻止拆分发送；groupedId=' + String(groupedId) + '，消息ID=' + centerId);
+    err.code = 'INCOMPLETE_ALBUM';
+    throw err;
+  }
+  return album;
+}
+
 async function forwardTelegramAlbum(key) {
   const queue = albumQueues.get(key);
   if (!queue) return;
@@ -406,18 +429,14 @@ async function forwardTelegramAlbum(key) {
     if (!client) return;
 
     const source = await client.getEntity(Number(queue.sourceChatId));
-    // 从 Telegram 重新读取相册附近消息，确保一次 API 请求包含完整 groupedId，
-    // 不依赖实时事件是否在短时间内全部抵达。
+    // Re-read a bounded ID window and require the complete album before sending.
+    // If Telegram does not return the full group, fail closed rather than split it.
     for (const id of [...ids]) {
       const got = await client.getMessages(source, { ids: [id] });
       const msg = Array.isArray(got) ? got[0] : got;
       if (!msg?.groupedId) continue;
-      const around = await client.getMessages(source, { limit: 40, minId: Math.max(0, Number(msg.id) - 20), maxId: Number(msg.id) + 21 });
-      for (const item of around || []) {
-        if (item?.groupedId != null && String(item.groupedId) === String(msg.groupedId)) {
-          ids.add(Number(item.id));
-        }
-      }
+      const album = await getCompleteAlbumMessages(client, source, msg);
+      for (const item of album) ids.add(Number(item.id));
     }
 
     const sortedIds = [...ids].sort((a, b) => a - b);
@@ -1599,13 +1618,9 @@ async function syncTask(task) {
 
           let messages=[msg];
           if(msg.groupedId!=null){
-            try{
-              const around=await client.getMessages(source,{limit:30,around:Number(msg.id)});
-              const album=around.filter(x=>x && x.groupedId!=null && String(x.groupedId)===String(msg.groupedId));
-              if(album.length)messages=album.sort((a,b)=>Number(a.id)-Number(b.id));
-            }catch(err){
-              console.error('历史相册读取失败',taskId,id,err?.message||err);
-            }
+            // Never fall back to the current single message when album lookup fails.
+            // "around" is not a supported getMessages option in GramJS and caused splits.
+            messages = await getCompleteAlbumMessages(client, source, msg);
             let albumHasPriorForward = false;
             for(const item of messages){
               if(await isAlreadyForwarded(taskId,item.id)) { albumHasPriorForward = true; break; }
@@ -1652,6 +1667,11 @@ async function syncTask(task) {
         }catch(singleErr){
           if (singleErr?.code === 'DAILY_FORWARD_LIMIT') {
             console.warn('历史同步达到每日转发上限，暂停任务', taskId, singleErr.message);
+            await p.query('UPDATE forward_tasks SET status="paused" WHERE id=? AND admin_id=?', [taskId, userId]);
+            return;
+          }
+          if (singleErr?.code === 'INCOMPLETE_ALBUM') {
+            console.error('历史相册不完整，已暂停任务以防拆分发送', taskId, id, singleErr.message);
             await p.query('UPDATE forward_tasks SET status="paused" WHERE id=? AND admin_id=?', [taskId, userId]);
             return;
           }
