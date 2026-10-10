@@ -4,7 +4,8 @@ import { Telegraf, Markup } from 'telegraf';
 import { TelegramClient, Api } from 'telegram';
 import { CustomFile } from 'telegram/client/uploads.js';
 import { StringSession } from 'telegram/sessions/index.js';
-import { NewMessage, Album } from 'telegram/events/index.js';
+import events from 'telegram/events/index.js';
+const { NewMessage, Album } = events;
 import QRCode from 'qrcode';
 
 const {
