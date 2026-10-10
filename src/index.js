@@ -732,9 +732,42 @@ async function forwardDiscussionRealtime(task, sourceChatId, messageId, ownerId)
   if (filters.clone_comments === false || !shouldForwardMessage(message,filters)) return;
 
   const reply = message?.replyTo;
-  const rootId = Number(reply?.replyToTopId || reply?.replyToMsgId || 0);
+  let rootId = Number(reply?.replyToTopId || 0);
+
+  // 普通讨论群的根转发帖本身没有 replyTo，不是评论，应安静跳过。
+  // 对于缺少 replyToTopId 的评论，先检查直接回复的消息是否就是已登记的根帖；
+  // 若回复的是另一条评论，则沿 reply 链向上查找，最多 12 层，避免把评论发错帖子。
   if (!rootId) {
-    console.log('评论区消息没有找到所属帖子根消息，跳过', task.id, sourceChatId, messageId);
+    let cursor = Number(reply?.replyToMsgId || 0);
+    if (!cursor) return;
+
+    const sourceChat = await client.getEntity(Number(sourceChatId));
+    const seen = new Set();
+    for (let depth = 0; cursor > 0 && depth < 12; depth++) {
+      if (seen.has(cursor)) break;
+      seen.add(cursor);
+
+      const [knownRoot] = await p.query(
+        'SELECT id FROM telegram_discussion_maps WHERE task_id=? AND source_discussion_chat_id=? AND source_discussion_root_id=? LIMIT 1',
+        [Number(task.id), Number(sourceChatId), cursor]
+      );
+      if (knownRoot.length) {
+        rootId = cursor;
+        break;
+      }
+
+      const gotParent = await client.getMessages(sourceChat, { ids: [cursor] });
+      const parent = Array.isArray(gotParent) ? gotParent[0] : gotParent;
+      if (!parent) break;
+      const parentReply = parent.replyTo;
+      const next = Number(parentReply?.replyToTopId || parentReply?.replyToMsgId || 0);
+      if (!next || next === cursor) break;
+      cursor = next;
+    }
+  }
+
+  if (!rootId) {
+    console.warn('评论区回复链无法解析根帖，跳过', task.id, sourceChatId, messageId);
     return;
   }
 
