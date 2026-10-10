@@ -520,75 +520,47 @@ function makeUploadFile(message, buffer) {
   return new CustomFile(inferUploadFilename(message), data.length, '', data);
 }
 
-async function sendTelegramMessagesWithoutSource(client, target, messages, topicResolver = null, replyResolver = null, filters = null) {
-  const list = [...messages].filter(Boolean).map(msg => applyContentFiltersToMessage(msg, filters)).filter(Boolean);
+async function sendTelegramMessagesWithoutSource(client, source, target, messages, topicResolver = null, replyResolver = null, filters = null) {
+  // Use Telegram's native forwarding API: no media download/re-upload, preserving
+  // photo/video types, captions, and albums as native forwarded messages.
+  const list = [...messages].filter(Boolean);
   if (!list.length) return [];
   const sent = [];
-  const albums = new Map();
   const pushSent = (sourceIds, result) => {
     const results = Array.isArray(result) ? result.filter(Boolean) : [result].filter(Boolean);
     const ids = Array.isArray(sourceIds) ? sourceIds : [sourceIds];
     results.forEach((item, index) => sent.push({ sourceId: Number(ids[index] || ids[0] || 0), sent: item }));
   };
   const replyOptions = (topicId, replyId) => {
-    // GramJS sendFile() expects replyTo to be a numeric message ID. Passing
-    // Api.InputReplyToMessage here can raise "Invalid message type: VirtualClass"
-    // while uploading media. A direct reply stays in its topic automatically;
-    // otherwise reply to the topic starter to place the media in that topic.
     const topic = Number(topicId || 0);
     const messageId = Number(replyId > 0 ? replyId : topic);
     return messageId > 0 ? { replyTo: messageId } : {};
   };
-  const sendOne = async (msg, topicId, replyId) => {
-    const text = String(msg.message || '');
-    const reply = replyOptions(topicId, replyId);
-    if (msg.media) {
-      const buffer = await client.downloadMedia(msg, {});
-      if (!buffer) throw new Error('下载源媒体失败，源消息 ID=' + msg.id);
-      return client.sendFile(target, { file: makeUploadFile(msg, buffer), ...(text ? { caption: text } : {}), forceDocument: false, ...reply });
-    }
-    if (!text) throw new Error('源消息没有可发送的文本或媒体，源消息 ID=' + msg.id);
-    return client.sendMessage(target, { message: text, ...reply });
-  };
+  const groups = new Map();
   for (const msg of list) {
-    const topicId = topicResolver ? await topicResolver(msg) : 0;
-    const replyId = replyResolver ? await replyResolver(msg, topicId) : 0;
-    if (msg.groupedId != null && msg.media) {
-      const key = `${String(msg.groupedId)}:${topicId}:${replyId}`;
-      if (!albums.has(key)) albums.set(key, []);
-      albums.get(key).push({ msg, topicId, replyId });
-    } else {
-      const result = await sendOne(msg, topicId, replyId);
-      pushSent(msg.id, result);
-    }
+    if (!shouldForwardMessage(msg, filters)) continue;
+    const topicId = topicResolver ? Number(await topicResolver(msg) || 0) : 0;
+    const replyId = replyResolver ? Number(await replyResolver(msg, topicId) || 0) : 0;
+    const albumKey = msg.groupedId != null ? String(msg.groupedId) : 'single:' + Number(msg.id);
+    const key = albumKey + ':' + topicId + ':' + replyId;
+    if (!groups.has(key)) groups.set(key, { topicId, replyId, messages: [] });
+    groups.get(key).messages.push(msg);
   }
-  for (const group of albums.values()) {
-    group.sort((a, b) => Number(a.msg.id) - Number(b.msg.id));
-    const topicId = Number(group[0]?.topicId || 0);
-    const replyId = Number(group[0]?.replyId || 0);
-    const media = group.map(item => item.msg).filter(msg => msg.media);
-    if (!media.length) continue;
-    try {
-      const files = [];
-      for (const msg of media) {
-        const buffer = await client.downloadMedia(msg, {});
-        if (!buffer) throw new Error('下载相册媒体失败，源消息 ID=' + msg.id);
-        files.push(makeUploadFile(msg, buffer));
-      }
-      const captions = media.map(msg => String(msg.message || ''));
-      const result = await client.sendFile(target, { file: files, caption: captions, forceDocument: false, ...replyOptions(topicId, replyId) });
-      pushSent(media.map(msg => msg.id), result);
-    } catch (albumErr) {
-      console.error('相册整组发送失败，改为逐条发送并保留话题', albumErr?.message || albumErr);
-      for (const msg of media) {
-        const result = await sendOne(msg, topicId, replyId);
-        pushSent(msg.id, result);
-      }
-    }
+  for (const group of groups.values()) {
+    const items = group.messages.sort((a, b) => Number(a.id) - Number(b.id));
+    if (!items.length) continue;
+    const reply = replyOptions(group.topicId, group.replyId);
+    const ids = items.map(item => Number(item.id));
+    const result = await client.forwardMessages(target, {
+      messages: ids,
+      fromPeer: source,
+      dropAuthor: false,
+      ...reply
+    });
+    pushSent(ids, result);
   }
   return sent;
 }
-
 async function getForwardedTargetMessageId(taskId, sourceMessageId) {
   const p = await db();
   for (let i = 0; i < 4; i++) {
@@ -1013,6 +985,7 @@ async function forwardTelegramMessages(task, sourceChatId, messageIds, ownerId) 
     const topicEnabled = parseFilters(task.filters_json).clone_topics !== false;
     const result = await sendTelegramMessagesWithoutSource(
       client,
+      source,
       target,
       messages,
       topicEnabled ? async msg => ensureTargetForumTopic(client, task, source, target, getForumTopicId(msg)) : null,
@@ -1396,6 +1369,7 @@ async function syncTask(task) {
           const topicEnabled=filters.clone_topics!==false;
           const out=await sendTelegramMessagesWithoutSource(
             client,
+            source,
             target,
             messages,
             topicEnabled ? async item => ensureTargetForumTopic(client,task,source,target,getForumTopicId(item)) : null,
