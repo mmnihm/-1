@@ -34,6 +34,7 @@ const sessions = new Map();
 const runningJobs = new Set();
 const forwardingLocks = new Set();
 const albumQueues = new Map();
+const botAlbumQueues = new Map();
 const userClients = new Map();
 const clientStarting = new Map();
 const botUserNotifications = new Set();
@@ -626,12 +627,11 @@ async function sendTelegramMessagesWithoutSource(client, source, target, message
       id: ids,
       toPeer: targetPeer,
       randomId: ids.map((id, index) => BigInt(Date.now()) * 100000n + BigInt(Math.abs(id) * 10 + index + 1)),
-      dropAuthor: false
+      dropAuthor: true
     };
     // For forum groups, topMsgId is the actual target topic ID. replyTo in
     // GramJS's high-level helper is ignored by forwardMessages, causing General-topic posts.
-    if (topicId > 1) requestArgs.topMsgId = topicId;
-    else if (replyId > 0) requestArgs.topMsgId = replyId;
+    if (topicId > 0) requestArgs.topMsgId = topicId;
 
     const request = new Api.messages.ForwardMessages(requestArgs);
     const result = await client.invoke(request);
@@ -2663,6 +2663,44 @@ async function handleRealtimeMessage(ctx, message, chatId) {
     if (userClients.has(Number(task.admin_id))) continue;
 
     const filters = parseFilters(task.filters_json);
+
+    // Bot API 兜底路径也按媒体组复制，不能逐条 copyMessage，否则相册会被拆散。
+    if (message.media_group_id) {
+      const key = `bot-album:${task.id}:${chatId}:${message.media_group_id}`;
+      let queue = botAlbumQueues.get(key);
+      if (!queue) {
+        queue = { task, sourceChatId: Number(chatId), ids: new Set(), allowed: false, timer: null };
+        botAlbumQueues.set(key, queue);
+      }
+      queue.ids.add(Number(message.message_id));
+      queue.allowed = queue.allowed || Boolean(filters[type]);
+      if (queue.timer) clearTimeout(queue.timer);
+      queue.timer = setTimeout(async () => {
+        botAlbumQueues.delete(key);
+        const ids = [...queue.ids].sort((a, b) => a - b);
+        if (!queue.allowed || !ids.length) return;
+        try {
+          if (typeof bot.telegram.copyMessages !== 'function') {
+            throw new Error('当前 Telegraf 版本不支持 copyMessages；为避免拆散相册，已停止本组而不是逐个发送');
+          }
+          const copied = await bot.telegram.copyMessages(queue.task.target_chat_id, queue.sourceChatId, ids);
+          const returned = Array.isArray(copied) ? copied : [];
+          for (let index = 0; index < ids.length; index++) {
+            const targetId = Number(returned[index]?.message_id || returned[index]?.messageId || 0);
+            await markForwarded(queue.task.id, ids[index], targetId || null);
+          }
+          await db().then(p => p.query(
+            'UPDATE forward_tasks SET source_message_id=? WHERE id=?',
+            [ids[ids.length - 1], queue.task.id]
+          ));
+          console.log('Bot API 相册整组复制完成', queue.task.id, '源消息', ids.join(','), '返回数', returned.length);
+        } catch (err) {
+          console.error('Bot API 相册整组复制失败（未拆分发送）', queue.task.id, ids.join(','), err?.message || err);
+        }
+      }, 900);
+      continue;
+    }
+
     if (!filters[type]) continue;
 
     const lockKey = String(task.id) + ':' + String(message.message_id);
