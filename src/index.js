@@ -354,7 +354,7 @@ async function forwardTelegramAlbum(key) {
       const got = await client.getMessages(source, { ids: [id] });
       const msg = Array.isArray(got) ? got[0] : got;
       if (!msg?.groupedId) continue;
-      const around = await client.getMessages(source, { limit: 40, around: Number(msg.id) });
+      const around = await client.getMessages(source, { limit: 40, minId: Math.max(0, Number(msg.id) - 20), maxId: Number(msg.id) + 21 });
       for (const item of around || []) {
         if (item?.groupedId != null && String(item.groupedId) === String(msg.groupedId)) {
           ids.add(Number(item.id));
