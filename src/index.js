@@ -4,7 +4,7 @@ import { Telegraf, Markup } from 'telegraf';
 import { TelegramClient, Api } from 'telegram';
 import { CustomFile } from 'telegram/client/uploads.js';
 import { StringSession } from 'telegram/sessions/index.js';
-import { NewMessage } from 'telegram/events/index.js';
+import { NewMessage, Album } from 'telegram/events/index.js';
 import QRCode from 'qrcode';
 
 const {
@@ -254,22 +254,43 @@ async function attachTelegramEvents(client, ownerId) {
         if(Number(task.target_chat_id)===sourceChatId)continue;
         const filters=parseFilters(task.filters_json);
         if(message.groupedId==null && !shouldForwardMessage(message,filters))continue;
-        if(message.groupedId!=null){
-          const key=`album:${task.id}:${sourceChatId}:${String(message.groupedId)}`;
-          let queue=albumQueues.get(key);
-          if(!queue){
-            queue={task,ownerId:uid,sourceChatId,ids:new Set(),timer:null};
-            albumQueues.set(key,queue);
-          }
-          queue.ids.add(Number(message.id));
-          if(queue.timer)clearTimeout(queue.timer);
-          queue.timer=setTimeout(()=>forwardTelegramAlbum(key).catch(err=>console.error('MTProto 相册转发失败',task.id,err?.message||err)),1500);
-        }else{
-          await forwardTelegramMessages(task,sourceChatId,[Number(message.id)],uid);
-        }
+        // Grouped media is handled by GramJS's Album event below. Do not
+        // process each NewMessage update independently, or the album races itself.
+        if(message.groupedId!=null)continue;
+        await forwardTelegramMessages(task,sourceChatId,[Number(message.id)],uid);
       }
     }catch(err){console.error('MTProto 新消息处理失败',err?.message||err);}
   },new NewMessage({}));
+
+  // GramJS emits one Album event containing the complete grouped media set.
+  // This is more reliable than collecting separate NewMessage updates with a timer.
+  client.addEventHandler(async event => {
+    try {
+      const messages = Array.isArray(event?.messages) ? event.messages.filter(Boolean) : [];
+      if (messages.length < 2) return;
+      const first = messages[0];
+      const sourceChatId = first?.peerId
+        ? Number(await client.getPeerId(first.peerId))
+        : (first?.chatId != null ? Number(first.chatId) : null);
+      if (!first?.id || sourceChatId == null) return;
+      const p = await db();
+      const [tasks] = await p.query(
+        'SELECT * FROM forward_tasks WHERE admin_id=? AND source_chat_id=? AND realtime=1',
+        [uid, sourceChatId]
+      );
+      const ids = [...new Set(messages.map(message => Number(message?.id)).filter(Boolean))].sort((a,b) => a-b);
+      if (ids.length < 2) return;
+      console.log('GramJS Album 事件收到完整相册', '源频道', sourceChatId, '消息ID', ids.join(','));
+      for (const task of tasks) {
+        if (Number(task.target_chat_id) === sourceChatId) continue;
+        const filters = parseFilters(task.filters_json);
+        if (!messages.some(message => shouldForwardMessage(message, filters))) continue;
+        await forwardTelegramMessages(task, sourceChatId, ids, uid);
+      }
+    } catch (err) {
+      console.error('GramJS Album 事件处理失败', err?.message || err);
+    }
+  }, new Album({}));
 }
 
 async function repairLegacyTaskChatIds(userId) {
